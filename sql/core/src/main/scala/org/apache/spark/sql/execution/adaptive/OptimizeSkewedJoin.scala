@@ -64,7 +64,7 @@ case class OptimizeSkewedJoin(ensureRequirements: EnsureRequirements)
    */
   def getSkewThreshold(medianSize: Long): Long = {
     conf.getConf(SQLConf.SKEW_JOIN_SKEWED_PARTITION_THRESHOLD).max(
-      medianSize * conf.getConf(SQLConf.SKEW_JOIN_SKEWED_PARTITION_FACTOR))
+      (medianSize * conf.getConf(SQLConf.SKEW_JOIN_SKEWED_PARTITION_FACTOR)).toLong)
   }
 
   /**
@@ -121,8 +121,8 @@ case class OptimizeSkewedJoin(ensureRequirements: EnsureRequirements)
     assert(leftSizes.length == rightSizes.length)
     val numPartitions = leftSizes.length
     // We use the median size of the original shuffle partitions to detect skewed partitions.
-    val leftMedSize = Utils.median(leftSizes)
-    val rightMedSize = Utils.median(rightSizes)
+    val leftMedSize = Utils.median(leftSizes, false)
+    val rightMedSize = Utils.median(rightSizes, false)
     logDebug(
       s"""
          |Optimizing skewed join.

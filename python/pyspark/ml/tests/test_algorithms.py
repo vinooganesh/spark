@@ -83,6 +83,41 @@ class LogisticRegressionTest(SparkSessionTestCase):
             np.allclose(model.interceptVector.toArray(), [-0.9057, -1.1392, -0.0033], atol=1e-4)
         )
 
+    def test_logistic_regression_with_threshold(self):
+
+        df = self.spark.createDataFrame(
+            [
+                (1.0, 1.0, Vectors.dense(0.0, 5.0)),
+                (0.0, 2.0, Vectors.dense(1.0, 2.0)),
+                (1.0, 3.0, Vectors.dense(2.0, 1.0)),
+                (0.0, 4.0, Vectors.dense(3.0, 3.0)),
+            ],
+            ["label", "weight", "features"],
+        )
+
+        lor = LogisticRegression(weightCol="weight")
+        model = lor.fit(df)
+
+        # status changes 1
+        for t in [0.0, 0.1, 0.2, 0.5, 1.0]:
+            model.setThreshold(t).transform(df)
+
+        # status changes 2
+        [model.setThreshold(t).predict(Vectors.dense(0.0, 5.0)) for t in [0.0, 0.1, 0.2, 0.5, 1.0]]
+
+        self.assertEqual(
+            [row.prediction for row in model.setThreshold(0.0).transform(df).collect()],
+            [1.0, 1.0, 1.0, 1.0],
+        )
+        self.assertEqual(
+            [row.prediction for row in model.setThreshold(0.5).transform(df).collect()],
+            [0.0, 1.0, 1.0, 0.0],
+        )
+        self.assertEqual(
+            [row.prediction for row in model.setThreshold(1.0).transform(df).collect()],
+            [0.0, 0.0, 0.0, 0.0],
+        )
+
 
 class MultilayerPerceptronClassifierTest(SparkSessionTestCase):
     def test_raw_and_probability_prediction(self):
@@ -101,7 +136,15 @@ class MultilayerPerceptronClassifierTest(SparkSessionTestCase):
         expected_rawPrediction = [-11.6081922998, -8.15827998691, 22.17757045]
         self.assertTrue(result.prediction, expected_prediction)
         self.assertTrue(np.allclose(result.probability, expected_probability, atol=1e-4))
-        self.assertTrue(np.allclose(result.rawPrediction, expected_rawPrediction, rtol=0.11))
+        # Use `assert_allclose` to show the value of `result.rawPrediction` in the assertion error
+        # message
+        np.testing.assert_allclose(
+            result.rawPrediction,
+            expected_rawPrediction,
+            rtol=0.3,
+            # Use the same default value as `np.allclose`
+            atol=1e-08,
+        )
 
 
 class OneVsRestTests(SparkSessionTestCase):
@@ -405,7 +448,7 @@ if __name__ == "__main__":
     from pyspark.ml.tests.test_algorithms import *  # noqa: F401
 
     try:
-        import xmlrunner  # type: ignore[import]
+        import xmlrunner
 
         testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
     except ImportError:

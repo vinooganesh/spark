@@ -23,12 +23,13 @@ import java.nio.charset.StandardCharsets
 import java.util.zip.GZIPOutputStream
 
 import scala.io.Source
+import scala.util.control.NonFatal
 
 import com.google.common.io.Files
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.io._
-import org.apache.hadoop.io.compress.{BZip2Codec, CompressionCodec, DefaultCodec, Lz4Codec}
+import org.apache.hadoop.io.compress.{BZip2Codec, CompressionCodec, DefaultCodec, Lz4Codec, SnappyCodec}
 import org.apache.hadoop.mapred.{FileAlreadyExistsException, FileSplit, JobConf, TextInputFormat, TextOutputFormat}
 import org.apache.hadoop.mapreduce.Job
 import org.apache.hadoop.mapreduce.lib.input.{FileSplit => NewFileSplit, TextInputFormat => NewTextInputFormat}
@@ -38,7 +39,7 @@ import org.apache.spark.internal.config._
 import org.apache.spark.rdd.{HadoopRDD, NewHadoopRDD}
 import org.apache.spark.serializer.KryoSerializer
 import org.apache.spark.storage.StorageLevel
-import org.apache.spark.util.{Utils, VersionUtils}
+import org.apache.spark.util.Utils
 
 class FileSuite extends SparkFunSuite with LocalSparkContext {
   var tempDir: File = _
@@ -136,10 +137,19 @@ class FileSuite extends SparkFunSuite with LocalSparkContext {
   }
 
   // Hadoop "gzip" and "zstd" codecs require native library installed for sequence files
-  // "snappy" codec does not work due to SPARK-36681.
-  val codecs = Seq((new DefaultCodec(), "default"), (new BZip2Codec(), "bzip2")) ++ {
-    if (VersionUtils.isHadoop3) Seq((new Lz4Codec(), "lz4")) else Seq()
-  }
+  private val codecs = Seq((new DefaultCodec(), "default"), (new BZip2Codec(), "bzip2")) ++ {
+    try {
+      // See HADOOP-17125. Hadoop lower than 3.3.1 can throw an exception when its native
+      // library for Snappy is unavailable. Here it calls `SnappyCodec.getCompressorType`
+      // to indirectly test if the Snappy native library is available in lower Hadoop versions.
+      new SnappyCodec().getCompressorType
+      Some(new SnappyCodec(), "snappy")
+    } catch {
+      case _: LinkageError => None
+      case NonFatal(_) => None
+    }
+  } ++ Seq((new Lz4Codec(), "lz4"))
+
   codecs.foreach { case (codec, codecName) =>
     runSequenceFileCodecTest(codec, codecName)
   }

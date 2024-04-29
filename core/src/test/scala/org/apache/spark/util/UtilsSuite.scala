@@ -36,10 +36,10 @@ import org.apache.commons.lang3.{JavaVersion, SystemUtils}
 import org.apache.commons.math3.stat.inference.ChiSquareTest
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
+import org.apache.hadoop.ipc.{CallerContext => HadoopCallerContext}
 import org.apache.logging.log4j.Level
 
 import org.apache.spark.{SparkConf, SparkException, SparkFunSuite, TaskContext}
-import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.Tests.IS_TESTING
 import org.apache.spark.launcher.SparkLauncher
@@ -47,7 +47,7 @@ import org.apache.spark.network.util.ByteUnit
 import org.apache.spark.scheduler.SparkListener
 import org.apache.spark.util.io.ChunkedByteBufferInputStream
 
-class UtilsSuite extends SparkFunSuite with ResetSystemProperties with Logging {
+class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
 
   test("timeConversion") {
     // Test -1
@@ -227,15 +227,16 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties with Logging {
       try {
         // Get a handle on the buffered data, to make sure memory gets freed once we read past the
         // end of it. Need to use reflection to get handle on inner structures for this check
-        val byteBufferInputStream = if (mergedStream.isInstanceOf[ChunkedByteBufferInputStream]) {
-          assert(inputLength < limit)
-          mergedStream.asInstanceOf[ChunkedByteBufferInputStream]
-        } else {
-          assert(inputLength >= limit)
-          val sequenceStream = mergedStream.asInstanceOf[SequenceInputStream]
-          val fieldValue = getFieldValue(sequenceStream, "in")
-          assert(fieldValue.isInstanceOf[ChunkedByteBufferInputStream])
-          fieldValue.asInstanceOf[ChunkedByteBufferInputStream]
+        val byteBufferInputStream = mergedStream match {
+          case stream: ChunkedByteBufferInputStream =>
+            assert(inputLength < limit)
+            stream
+          case _ =>
+            assert(inputLength >= limit)
+            val sequenceStream = mergedStream.asInstanceOf[SequenceInputStream]
+            val fieldValue = getFieldValue(sequenceStream, "in")
+            assert(fieldValue.isInstanceOf[ChunkedByteBufferInputStream])
+            fieldValue.asInstanceOf[ChunkedByteBufferInputStream]
         }
         (0 until inputLength).foreach { idx =>
           assert(bytes(idx) === mergedStream.read().asInstanceOf[Byte])
@@ -463,7 +464,7 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties with Logging {
 
   test("get iterator size") {
     val empty = Seq[Int]()
-    assert(Utils.getIteratorSize(empty.toIterator) === 0L)
+    assert(Utils.getIteratorSize(empty.iterator) === 0L)
     val iterator = Iterator.range(0, 5)
     assert(Utils.getIteratorSize(iterator) === 5L)
   }
@@ -526,7 +527,11 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties with Logging {
     // 6. Symbolic link
     val scenario6 = java.nio.file.Files.createSymbolicLink(new File(testDir, "scenario6")
       .toPath, scenario1.toPath).toFile
-    assert(!Utils.createDirectory(scenario6))
+    if (Utils.isJavaVersionAtLeast21) {
+      assert(Utils.createDirectory(scenario6))
+    } else {
+      assert(!Utils.createDirectory(scenario6))
+    }
     assert(scenario6.exists())
 
     // 7. Directory exists
@@ -957,10 +962,8 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties with Logging {
   test("Set Spark CallerContext") {
     val context = "test"
     new CallerContext(context).setCurrentContext()
-    if (CallerContext.callerContextSupported) {
-      val callerContext = Utils.classForName("org.apache.hadoop.ipc.CallerContext")
-      assert(s"SPARK_$context" ===
-        callerContext.getMethod("getCurrent").invoke(null).toString)
+    if (CallerContext.callerContextEnabled) {
+      assert(s"SPARK_$context" === HadoopCallerContext.getCurrent.toString)
     }
   }
 
@@ -1023,7 +1026,7 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties with Logging {
         file.deleteOnExit()
         val cmd =
           s"""
-             |#!/bin/bash
+             |#!/usr/bin/env bash
              |trap "" SIGTERM
              |sleep 10
            """.stripMargin

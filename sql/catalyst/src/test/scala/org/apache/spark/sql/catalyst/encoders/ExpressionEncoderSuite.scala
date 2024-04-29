@@ -24,14 +24,15 @@ import java.util.Arrays
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.runtime.universe.TypeTag
 
-import org.apache.spark.SparkArithmeticException
+import org.apache.spark.{SPARK_DOC_ROOT, SparkArithmeticException, SparkRuntimeException, SparkUnsupportedOperationException}
 import org.apache.spark.sql.{Encoder, Encoders}
-import org.apache.spark.sql.catalyst.{FooClassWithEnum, FooEnum, OptionalData, PrimitiveData}
+import org.apache.spark.sql.catalyst.{FooClassWithEnum, FooEnum, OptionalData, PrimitiveData, ScroogeLikeExample}
 import org.apache.spark.sql.catalyst.analysis.AnalysisTest
 import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.plans.CodegenInterpretedPlanTest
 import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
+import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.catalyst.util.ArrayData
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
@@ -131,6 +132,11 @@ case class MapOfValueClassKey(m: Map[IntWrapper, String])
 case class MapOfValueClassValue(m: Map[String, StringWrapper])
 case class OptionOfValueClassValue(o: Option[StringWrapper])
 case class CaseClassWithGeneric[T](generic: T, value: IntWrapper)
+case class NestedGeneric[T](generic: CaseClassWithGeneric[T])
+case class SeqNestedGeneric[T](list: Seq[T])
+case class OptionNestedGeneric[T](list: Option[T])
+case class MapNestedGenericKey[T](list: Map[T, Int])
+case class MapNestedGenericValue[T](list: Map[Int, T])
 
 class ExpressionEncoderSuite extends CodegenInterpretedPlanTest with AnalysisTest {
   OuterScopes.addOuterScope(this)
@@ -454,19 +460,53 @@ class ExpressionEncoderSuite extends CodegenInterpretedPlanTest with AnalysisTes
     "nested tuple._2 of class value")
   encodeDecodeTest(CaseClassWithGeneric(IntWrapper(1), IntWrapper(2)),
     "case class with value class in generic parameter")
+  encodeDecodeTest(NestedGeneric(CaseClassWithGeneric(IntWrapper(1), IntWrapper(2))),
+    "case class with nested generic parameter")
+  encodeDecodeTest(SeqNestedGeneric(List(2)),
+    "case class with nested generic parameter seq")
+  encodeDecodeTest(SeqNestedGeneric(List(IntWrapper(2))),
+    "case class with value class and nested generic parameter seq")
+  encodeDecodeTest(OptionNestedGeneric(Some(2)),
+    "case class with nested generic option")
+  encodeDecodeTest(MapNestedGenericKey(Map(1 -> 2)),
+    "case class with nested generic map key ")
+  encodeDecodeTest(MapNestedGenericValue(Map(1 -> 2)),
+    "case class with nested generic map value")
 
   encodeDecodeTest(Option(31), "option of int")
   encodeDecodeTest(Option.empty[Int], "empty option of int")
   encodeDecodeTest(Option("abc"), "option of string")
   encodeDecodeTest(Option.empty[String], "empty option of string")
+  encodeDecodeTest(Seq(Some(Seq(0))), "SPARK-45896: seq of option of seq")
+  encodeDecodeTest(Map(0 -> Some(Seq(0))), "SPARK-45896: map of option of seq")
+  encodeDecodeTest(Seq(Some(Timestamp.valueOf("2023-01-01 00:00:00"))),
+    "SPARK-45896: seq of option of timestamp")
+  encodeDecodeTest(Map(0 -> Some(Timestamp.valueOf("2023-01-01 00:00:00"))),
+    "SPARK-45896: map of option of timestamp")
+  encodeDecodeTest(Seq(Some(Date.valueOf("2023-01-01"))),
+    "SPARK-45896: seq of option of date")
+  encodeDecodeTest(Map(0 -> Some(Date.valueOf("2023-01-01"))),
+    "SPARK-45896: map of option of date")
+  encodeDecodeTest(Seq(Some(BigDecimal(200))), "SPARK-45896: seq of option of bigdecimal")
+  encodeDecodeTest(Map(0 -> Some(BigDecimal(200))), "SPARK-45896: map of option of bigdecimal")
+
+  encodeDecodeTest(ScroogeLikeExample(1),
+    "SPARK-40385 class with only a companion object constructor")
+
+  encodeDecodeTest(Array(Set(1, 2), Set(2, 3)), "array of sets")
 
   productTest(("UDT", new ExamplePoint(0.1, 0.2)))
 
   test("AnyVal class with Any fields") {
-    val exception = intercept[UnsupportedOperationException](implicitly[ExpressionEncoder[Foo]])
-    val errorMsg = exception.getMessage
-    assert(errorMsg.contains("root class: \"org.apache.spark.sql.catalyst.encoders.Foo\""))
-    assert(errorMsg.contains("No Encoder found for Any"))
+    val exception = intercept[SparkUnsupportedOperationException](
+      implicitly[ExpressionEncoder[Foo]])
+    checkError(
+      exception = exception,
+      errorClass = "ENCODER_NOT_FOUND",
+      parameters = Map(
+        "typeName" -> "Any",
+        "docroot" -> SPARK_DOC_ROOT)
+    )
   }
 
   test("nullable of encoder schema") {
@@ -519,14 +559,24 @@ class ExpressionEncoderSuite extends CodegenInterpretedPlanTest with AnalysisTes
 
   test("null check for map key: String") {
     val toRow = ExpressionEncoder[Map[String, Int]]().createSerializer()
-    val e = intercept[RuntimeException](toRow(Map(("a", 1), (null, 2))))
-    assert(e.getMessage.contains("Cannot use null as map key"))
+    val e = intercept[SparkRuntimeException](toRow(Map(("a", 1), (null, 2))))
+    assert(e.getCause.isInstanceOf[SparkRuntimeException])
+    checkError(
+      exception = e.getCause.asInstanceOf[SparkRuntimeException],
+      errorClass = "NULL_MAP_KEY",
+      parameters = Map.empty
+    )
   }
 
   test("null check for map key: Integer") {
     val toRow = ExpressionEncoder[Map[Integer, String]]().createSerializer()
-    val e = intercept[RuntimeException](toRow(Map((1, "a"), (null, "b"))))
-    assert(e.getMessage.contains("Cannot use null as map key"))
+    val e = intercept[SparkRuntimeException](toRow(Map((1, "a"), (null, "b"))))
+    assert(e.getCause.isInstanceOf[SparkRuntimeException])
+    checkError(
+      exception = e.getCause.asInstanceOf[SparkRuntimeException],
+      errorClass = "NULL_MAP_KEY",
+      parameters = Map.empty
+    )
   }
 
   test("throw exception for tuples with more than 22 elements") {
@@ -633,7 +683,7 @@ class ExpressionEncoderSuite extends CodegenInterpretedPlanTest with AnalysisTes
       ClosureCleaner.clean((s: String) => encoder.getClass.getName)
 
       val row = encoder.createSerializer().apply(input)
-      val schema = encoder.schema.toAttributes
+      val schema = toAttributes(encoder.schema)
       val boundEncoder = encoder.resolveAndBind()
       val convertedBack = try boundEncoder.createDeserializer().apply(row) catch {
         case e: Exception =>

@@ -37,6 +37,7 @@ Attributes and underlying data
    :toctree: api/
 
    DataFrame.index
+   DataFrame.info
    DataFrame.columns
    DataFrame.empty
 
@@ -62,7 +63,6 @@ Conversion
    DataFrame.isnull
    DataFrame.notna
    DataFrame.notnull
-   DataFrame.pad
    DataFrame.bool
 
 Indexing, iteration
@@ -77,6 +77,7 @@ Indexing, iteration
    DataFrame.idxmin
    DataFrame.loc
    DataFrame.iloc
+   DataFrame.insert
    DataFrame.items
    DataFrame.iteritems
    DataFrame.iterrows
@@ -147,9 +148,11 @@ Computations / Descriptive Stats
    DataFrame.any
    DataFrame.clip
    DataFrame.corr
+   DataFrame.corrwith
    DataFrame.count
    DataFrame.cov
    DataFrame.describe
+   DataFrame.ewm
    DataFrame.kurt
    DataFrame.kurtosis
    DataFrame.mad
@@ -157,10 +160,12 @@ Computations / Descriptive Stats
    DataFrame.mean
    DataFrame.min
    DataFrame.median
+   DataFrame.mode
    DataFrame.pct_change
    DataFrame.prod
    DataFrame.product
    DataFrame.quantile
+   DataFrame.rank
    DataFrame.nunique
    DataFrame.sem
    DataFrame.skew
@@ -194,6 +199,8 @@ Reindexing / Selection / Label manipulation
    DataFrame.first
    DataFrame.head
    DataFrame.last
+   DataFrame.reindex
+   DataFrame.reindex_like
    DataFrame.rename
    DataFrame.rename_axis
    DataFrame.reset_index
@@ -218,6 +225,8 @@ Missing data handling
    DataFrame.replace
    DataFrame.bfill
    DataFrame.ffill
+   DataFrame.interpolate
+   DataFrame.pad
 
 Reshaping, sorting, transposing
 -------------------------------
@@ -237,9 +246,6 @@ Reshaping, sorting, transposing
    DataFrame.squeeze
    DataFrame.T
    DataFrame.transpose
-   DataFrame.reindex
-   DataFrame.reindex_like
-   DataFrame.rank
 
 Combining / joining / merging
 -----------------------------
@@ -251,13 +257,13 @@ Combining / joining / merging
    DataFrame.merge
    DataFrame.join
    DataFrame.update
-   DataFrame.insert
 
 Time series-related
 -------------------
 .. autosummary::
    :toctree: api/
 
+   DataFrame.resample
    DataFrame.shift
    DataFrame.first_valid_index
    DataFrame.last_valid_index
@@ -267,13 +273,14 @@ Serialization / IO / Conversion
 .. autosummary::
    :toctree: api/
 
+   DataFrame.from_dict
    DataFrame.from_records
-   DataFrame.info
    DataFrame.to_table
    DataFrame.to_delta
    DataFrame.to_parquet
    DataFrame.to_spark_io
    DataFrame.to_csv
+   DataFrame.to_orc
    DataFrame.to_pandas
    DataFrame.to_html
    DataFrame.to_numpy
@@ -321,11 +328,13 @@ specific plotting methods of the form ``DataFrame.plot.<kind>``.
    DataFrame.plot.barh
    DataFrame.plot.bar
    DataFrame.plot.hist
+   DataFrame.plot.box
    DataFrame.plot.line
    DataFrame.plot.pie
    DataFrame.plot.scatter
    DataFrame.plot.density
    DataFrame.hist
+   DataFrame.boxplot
    DataFrame.kde
 
 Pandas-on-Spark specific

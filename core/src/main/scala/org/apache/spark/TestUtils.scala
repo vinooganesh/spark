@@ -193,12 +193,15 @@ private[spark] object TestUtils {
       baseClass: String = null,
       classpathUrls: Seq[URL] = Seq.empty,
       implementsClasses: Seq[String] = Seq.empty,
-      extraCodeBody: String = ""): File = {
+      extraCodeBody: String = "",
+      packageName: Option[String] = None): File = {
     val extendsText = Option(baseClass).map { c => s" extends ${c}" }.getOrElse("")
     val implementsText =
       "implements " + (implementsClasses :+ "java.io.Serializable").mkString(", ")
+    val packageText = packageName.map(p => s"package $p;\n").getOrElse("")
     val sourceFile = new JavaSourceFromString(className,
       s"""
+         |$packageText
          |public class $className $extendsText $implementsText {
          |  @Override public String toString() { return "$toStringValue"; }
          |
@@ -263,7 +266,8 @@ private[spark] object TestUtils {
       contains = contain(e, msg)
     }
     assert(contains,
-      s"Exception tree doesn't contain the expected exception ${typeMsg}with message: $msg")
+      s"Exception tree doesn't contain the expected exception ${typeMsg}with message: $msg\n" +
+        Utils.exceptionString(e))
   }
 
   /**
@@ -280,9 +284,19 @@ private[spark] object TestUtils {
     attempt.isSuccess && attempt.get == 0
   }
 
-  def isPythonVersionAtLeast38(): Boolean = {
+  // SPARK-40053: This string needs to be updated when the
+  // minimum python supported version changes.
+  val minimumPythonSupportedVersion: String = "3.7.0"
+
+  def isPythonVersionAvailable: Boolean = {
+    val version = minimumPythonSupportedVersion.split('.').map(_.toInt)
+    assert(version.length == 3)
+    isPythonVersionAtLeast(version(0), version(1), version(2))
+  }
+
+  private def isPythonVersionAtLeast(major: Int, minor: Int, reversion: Int): Boolean = {
     val cmdSeq = if (Utils.isWindows) Seq("cmd.exe", "/C") else Seq("sh", "-c")
-    val pythonSnippet = "import sys; sys.exit(sys.version_info < (3, 8, 0))"
+    val pythonSnippet = s"import sys; sys.exit(sys.version_info < ($major, $minor, $reversion))"
     Try(Process(cmdSeq :+ s"python3 -c '$pythonSnippet'").! == 0).getOrElse(false)
   }
 
@@ -337,22 +351,26 @@ private[spark] object TestUtils {
     connection.setRequestMethod(method)
     headers.foreach { case (k, v) => connection.setRequestProperty(k, v) }
 
-    // Disable cert and host name validation for HTTPS tests.
-    if (connection.isInstanceOf[HttpsURLConnection]) {
-      val sslCtx = SSLContext.getInstance("SSL")
-      val trustManager = new X509TrustManager {
-        override def getAcceptedIssuers(): Array[X509Certificate] = null
-        override def checkClientTrusted(x509Certificates: Array[X509Certificate],
-            s: String): Unit = {}
-        override def checkServerTrusted(x509Certificates: Array[X509Certificate],
-            s: String): Unit = {}
-      }
-      val verifier = new HostnameVerifier() {
-        override def verify(hostname: String, session: SSLSession): Boolean = true
-      }
-      sslCtx.init(null, Array(trustManager), new SecureRandom())
-      connection.asInstanceOf[HttpsURLConnection].setSSLSocketFactory(sslCtx.getSocketFactory())
-      connection.asInstanceOf[HttpsURLConnection].setHostnameVerifier(verifier)
+    connection match {
+      // Disable cert and host name validation for HTTPS tests.
+      case httpConnection: HttpsURLConnection =>
+        val sslCtx = SSLContext.getInstance("SSL")
+        val trustManager = new X509TrustManager {
+          override def getAcceptedIssuers: Array[X509Certificate] = null
+
+          override def checkClientTrusted(x509Certificates: Array[X509Certificate],
+              s: String): Unit = {}
+
+          override def checkServerTrusted(x509Certificates: Array[X509Certificate],
+              s: String): Unit = {}
+        }
+        val verifier = new HostnameVerifier() {
+          override def verify(hostname: String, session: SSLSession): Boolean = true
+        }
+        sslCtx.init(null, Array(trustManager), new SecureRandom())
+        httpConnection.setSSLSocketFactory(sslCtx.getSocketFactory)
+        httpConnection.setHostnameVerifier(verifier)
+      case _ => // do nothing
     }
 
     try {
@@ -426,7 +444,7 @@ private[spark] object TestUtils {
     val appenderBuilder = builder.newAppender("console", "CONSOLE")
       .addAttribute("target", ConsoleAppender.Target.SYSTEM_ERR)
     appenderBuilder.add(builder.newLayout("PatternLayout")
-      .addAttribute("pattern", "%d{yy/MM/dd HH:mm:ss} %p %c{1}: %m%n"))
+      .addAttribute("pattern", "%d{yy/MM/dd HH:mm:ss} %p %c{1}: %m%n%ex"))
     builder.add(appenderBuilder)
     builder.add(builder.newRootLogger(level).add(builder.newAppenderRef("console")))
     val configuration = builder.build()
@@ -440,6 +458,21 @@ private[spark] object TestUtils {
     require(f.isDirectory)
     val current = f.listFiles
     current ++ current.filter(_.isDirectory).flatMap(recursiveList)
+  }
+
+  /**
+   * Returns the list of files at 'path' recursively. This skips files that are ignored normally
+   * by MapReduce.
+   */
+  def listDirectory(path: File): Array[String] = {
+    val result = ArrayBuffer.empty[String]
+    if (path.isDirectory) {
+      path.listFiles.foreach(f => result.appendAll(listDirectory(f)))
+    } else {
+      val c = path.getName.charAt(0)
+      if (c != '.' && c != '_') result.append(path.getAbsolutePath)
+    }
+    result.toArray
   }
 
   /** Creates a temp JSON file that contains the input JSON record. */

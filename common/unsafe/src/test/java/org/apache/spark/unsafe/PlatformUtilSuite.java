@@ -95,18 +95,18 @@ public class PlatformUtilSuite {
     Assert.assertEquals(MemoryBlock.FREED_IN_ALLOCATOR_PAGE_NUMBER, block.pageNumber);
   }
 
-  @Test(expected = AssertionError.class)
+  @Test
   public void onHeapMemoryAllocatorThrowsAssertionErrorOnDoubleFree() {
     MemoryBlock block = MemoryAllocator.HEAP.allocate(1024);
     MemoryAllocator.HEAP.free(block);
-    MemoryAllocator.HEAP.free(block);
+    Assert.assertThrows(AssertionError.class, () -> MemoryAllocator.HEAP.free(block));
   }
 
-  @Test(expected = AssertionError.class)
+  @Test
   public void offHeapMemoryAllocatorThrowsAssertionErrorOnDoubleFree() {
     MemoryBlock block = MemoryAllocator.UNSAFE.allocate(1024);
     MemoryAllocator.UNSAFE.free(block);
-    MemoryAllocator.UNSAFE.free(block);
+    Assert.assertThrows(AssertionError.class, () -> MemoryAllocator.UNSAFE.free(block));
   }
 
   @Test
@@ -156,5 +156,12 @@ public class PlatformUtilSuite {
     MemoryBlock onheap4 = heapMem.allocate(1024 * 1024 + 7);
     Assert.assertEquals(1024 * 1024 + 7, onheap4.size());
     Assert.assertEquals(obj3, onheap4.getBaseObject());
+  }
+
+  @Test
+  public void cleanerCreateMethodIsDefined() {
+    // Regression test for SPARK-45508: we don't expect the "no cleaner" fallback
+    // path to be hit in normal usage.
+    Assert.assertTrue(Platform.cleanerCreateMethodIsDefined());
   }
 }

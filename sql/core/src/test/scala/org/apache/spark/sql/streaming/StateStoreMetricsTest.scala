@@ -17,12 +17,16 @@
 
 package org.apache.spark.sql.streaming
 
+import org.scalatest.time.SpanSugar._
+
 import org.apache.spark.sql.execution.streaming.StreamExecution
 
 trait StateStoreMetricsTest extends StreamTest {
 
   private var lastCheckedRecentProgressIndex = -1
   private var lastQuery: StreamExecution = null
+
+  override val streamingTimeout = 120.seconds
 
   override def beforeEach(): Unit = {
     super.beforeEach()
@@ -106,7 +110,7 @@ trait StateStoreMetricsTest extends StreamTest {
     AssertOnQuery(s"Check operator progress metrics: operatorName = $operatorName, " +
       s"numShufflePartitions = $numShufflePartitions, " +
       s"numStateStoreInstances = $numStateStoreInstances") { q =>
-      eventually(timeout(streamingTimeout)) {
+      eventually(timeout(streamingTimeout), interval(200.milliseconds)) {
         val (progressesSinceLastCheck, lastCheckedProgressIndex, numStateOperators) =
           retrieveProgressesSinceLastCheck(q)
         assert(operatorIndex < numStateOperators, s"Invalid operator Index: $operatorIndex")
@@ -131,7 +135,7 @@ trait StateStoreMetricsTest extends StreamTest {
   def assertNumStateRows(total: Seq[Long], updated: Seq[Long]): AssertOnQuery = {
     assert(total.length === updated.length)
     assertNumStateRows(
-      total, updated, droppedByWatermark = (0 until total.length).map(_ => 0L), None)
+      total, updated, droppedByWatermark = total.indices.map(_ => 0L), None)
   }
 
   def assertNumStateRows(

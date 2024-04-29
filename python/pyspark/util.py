@@ -27,7 +27,9 @@ import traceback
 from types import TracebackType
 from typing import Any, Callable, Iterator, List, Optional, TextIO, Tuple
 
-from py4j.clientserver import ClientServer  # type: ignore[import]
+from pyspark.errors import PySparkRuntimeError
+
+from py4j.clientserver import ClientServer
 
 __all__: List[str] = []
 
@@ -80,8 +82,11 @@ def fail_on_stopiteration(f: Callable) -> Callable:
         try:
             return f(*args, **kwargs)
         except StopIteration as exc:
-            raise RuntimeError(
-                "Caught StopIteration thrown from user's code; failing the task", exc
+            raise PySparkRuntimeError(
+                error_class="STOP_ITERATION_OCCURRED",
+                message_parameters={
+                    "exc": str(exc),
+                },
             )
 
     return wrapper
@@ -152,7 +157,7 @@ def try_simplify_traceback(tb: TracebackType) -> Optional[TracebackType]:
         ...
       File "/.../pyspark/util.py", line ...
         ...
-    RuntimeError: ...
+    pyspark.errors.exceptions.base.PySparkRuntimeError: ...
     >>> "pyspark/util.py" in exc_info
     True
 
@@ -168,7 +173,7 @@ def try_simplify_traceback(tb: TracebackType) -> Optional[TracebackType]:
     ...         traceback.format_exception(
     ...             type(e), e, try_simplify_traceback(skip_doctest_traceback(tb))))
     >>> print(exc_info)  # doctest: +NORMALIZE_WHITESPACE, +ELLIPSIS
-    RuntimeError: ...
+    pyspark.errors.exceptions.base.PySparkRuntimeError: ...
     >>> "pyspark/util.py" in exc_info
     False
 
@@ -331,13 +336,10 @@ def inheritable_thread_target(f: Callable) -> Callable:
 
         @functools.wraps(f)
         def wrapped(*args: Any, **kwargs: Any) -> Any:
-            try:
-                # Set local properties in child thread.
-                assert SparkContext._active_spark_context is not None
-                SparkContext._active_spark_context._jsc.sc().setLocalProperties(properties)
-                return f(*args, **kwargs)
-            finally:
-                InheritableThread._clean_py4j_conn_for_current_thread()
+            # Set local properties in child thread.
+            assert SparkContext._active_spark_context is not None
+            SparkContext._active_spark_context._jsc.sc().setLocalProperties(properties)
+            return f(*args, **kwargs)
 
         return wrapped
     else:
@@ -377,10 +379,7 @@ class InheritableThread(threading.Thread):
                 assert hasattr(self, "_props")
                 assert SparkContext._active_spark_context is not None
                 SparkContext._active_spark_context._jsc.sc().setLocalProperties(self._props)
-                try:
-                    return target(*a, **k)
-                finally:
-                    InheritableThread._clean_py4j_conn_for_current_thread()
+                return target(*a, **k)
 
             super(InheritableThread, self).__init__(
                 target=copy_local_properties, *args, **kwargs  # type: ignore[misc]
@@ -400,25 +399,6 @@ class InheritableThread(threading.Thread):
             assert SparkContext._active_spark_context is not None
             self._props = SparkContext._active_spark_context._jsc.sc().getLocalProperties().clone()
         return super(InheritableThread, self).start()
-
-    @staticmethod
-    def _clean_py4j_conn_for_current_thread() -> None:
-        from pyspark import SparkContext
-
-        jvm = SparkContext._jvm
-        assert jvm is not None
-        thread_connection = jvm._gateway_client.get_thread_connection()
-        if thread_connection is not None:
-            try:
-                # Dequeue is shared across other threads but it's thread-safe.
-                # If this function has to be invoked one more time in the same thead
-                # Py4J will create a new connection automatically.
-                jvm._gateway_client.deque.remove(thread_connection)
-            except ValueError:
-                # Should never reach this point
-                return
-            finally:
-                thread_connection.close()
 
 
 if __name__ == "__main__":

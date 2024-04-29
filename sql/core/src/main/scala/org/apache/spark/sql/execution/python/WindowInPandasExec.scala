@@ -22,17 +22,17 @@ import java.io.File
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 
-import org.apache.spark.{SparkEnv, TaskContext}
+import org.apache.spark.{JobArtifactSet, SparkEnv, TaskContext}
 import org.apache.spark.api.python.{ChainedPythonFunctions, PythonEvalType}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, Distribution, Partitioning}
+import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.{ExternalAppendOnlyUnsafeRowArray, SparkPlan}
+import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.window._
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.util.ArrowUtils
 import org.apache.spark.util.Utils
 
 /**
@@ -85,28 +85,10 @@ case class WindowInPandasExec(
     partitionSpec: Seq[Expression],
     orderSpec: Seq[SortOrder],
     child: SparkPlan)
-  extends WindowExecBase {
-
-  override def output: Seq[Attribute] =
-    child.output ++ windowExpression.map(_.toAttribute)
-
-  override def requiredChildDistribution: Seq[Distribution] = {
-    if (partitionSpec.isEmpty) {
-      // Only show warning when the number of bytes is larger than 100 MiB?
-      logWarning("No Partition Defined for Window operation! Moving all data to a single "
-        + "partition, this can cause serious performance degradation.")
-      AllTuples :: Nil
-    } else {
-      ClusteredDistribution(partitionSpec) :: Nil
-    }
-  }
-
-  override def requiredChildOrdering: Seq[Seq[SortOrder]] =
-    Seq(partitionSpec.map(SortOrder(_, Ascending)) ++ orderSpec)
-
-  override def outputOrdering: Seq[SortOrder] = child.outputOrdering
-
-  override def outputPartitioning: Partitioning = child.outputPartitioning
+  extends WindowExecBase with PythonSQLMetrics {
+  override lazy val metrics: Map[String, SQLMetric] = pythonMetrics ++ Map(
+    "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size")
+  )
 
   /**
    * Helper functions and data structures for window bounds
@@ -128,14 +110,15 @@ case class WindowInPandasExec(
 
   private val windowBoundTypeConf = "pandas_window_bound_types"
 
-  private def collectFunctions(udf: PythonUDF): (ChainedPythonFunctions, Seq[Expression]) = {
+  private def collectFunctions(
+      udf: PythonFuncExpression): (ChainedPythonFunctions, Seq[Expression]) = {
     udf.children match {
-      case Seq(u: PythonUDF) =>
+      case Seq(u: PythonFuncExpression) =>
         val (chained, children) = collectFunctions(u)
         (ChainedPythonFunctions(chained.funcs ++ Seq(udf.func)), children)
       case children =>
         // There should not be any other UDFs, or the children can't be evaluated directly.
-        assert(children.forall(_.find(_.isInstanceOf[PythonUDF]).isEmpty))
+        assert(children.forall(!_.exists(_.isInstanceOf[PythonFuncExpression])))
         (ChainedPythonFunctions(Seq(udf.func)), udf.children)
     }
   }
@@ -201,10 +184,13 @@ case class WindowInPandasExec(
     val inMemoryThreshold = conf.windowExecBufferInMemoryThreshold
     val spillThreshold = conf.windowExecBufferSpillThreshold
     val sessionLocalTimeZone = conf.sessionLocalTimeZone
+    val largeVarTypes = conf.arrowUseLargeVarTypes
 
     // Extract window expressions and window functions
     val windowExpressions = expressions.flatMap(_.collect { case e: WindowExpression => e })
-    val udfExpressions = windowExpressions.map(_.windowFunction.asInstanceOf[PythonUDF])
+    val udfExpressions = windowExpressions.map { e =>
+      e.windowFunction.asInstanceOf[AggregateExpression].aggregateFunction.asInstanceOf[PythonUDAF]
+    }
 
     // We shouldn't be chaining anything here.
     // All chained python functions should only contain one function.
@@ -213,7 +199,7 @@ case class WindowInPandasExec(
 
     val udfWindowBoundTypes = pyFuncs.indices.map(i =>
       frameWindowBoundTypes(expressionIndexToFrameIndex(i)))
-    val pythonRunnerConf: Map[String, String] = (ArrowUtils.getPythonRunnerConfMap(conf)
+    val pythonRunnerConf: Map[String, String] = (ArrowPythonRunner.getPythonRunnerConfMap(conf)
       + (windowBoundTypeConf -> udfWindowBoundTypes.map(_.value).mkString(",")))
 
     // Filter child output attributes down to only those that are UDF inputs.
@@ -267,6 +253,8 @@ case class WindowInPandasExec(
 
     val allInputs = windowBoundsInput ++ dataInputs
     val allInputTypes = allInputs.map(_.dataType)
+    val spillSize = longMetric("spillSize")
+    val jobArtifactUUID = JobArtifactSet.getCurrentJobArtifactState.map(_.uuid)
 
     // Start processing.
     child.execute().mapPartitions { iter =>
@@ -354,8 +342,15 @@ case class WindowInPandasExec(
         // Iteration
         var rowIndex = 0
 
-        override final def hasNext: Boolean =
-          (bufferIterator != null && bufferIterator.hasNext) || nextRowAvailable
+        override final def hasNext: Boolean = {
+          val found = (bufferIterator != null && bufferIterator.hasNext) || nextRowAvailable
+          if (!found) {
+            // clear final partition
+            buffer.clear()
+            spillSize += buffer.spillSize
+          }
+          found
+        }
 
         override final def next(): Iterator[UnsafeRow] = {
           // Load the next partition if we need to.
@@ -391,7 +386,10 @@ case class WindowInPandasExec(
         argOffsets,
         pythonInputSchema,
         sessionLocalTimeZone,
-        pythonRunnerConf).compute(pythonInput, context.partitionId(), context)
+        largeVarTypes,
+        pythonRunnerConf,
+        pythonMetrics,
+        jobArtifactUUID).compute(pythonInput, context.partitionId(), context)
 
       val joined = new JoinedRow
 

@@ -15,7 +15,9 @@
 # limitations under the License.
 #
 
+import unittest
 from datetime import timedelta
+from distutils.version import LooseVersion
 
 import pandas as pd
 
@@ -23,7 +25,7 @@ import pyspark.pandas as ps
 from pyspark.testing.pandasutils import PandasOnSparkTestCase, TestUtils
 
 
-class TimedeltaIndexTest(PandasOnSparkTestCase, TestUtils):
+class TimedeltaIndexTestsMixin:
     @property
     def pidx(self):
         return pd.TimedeltaIndex(
@@ -62,6 +64,44 @@ class TimedeltaIndexTest(PandasOnSparkTestCase, TestUtils):
     def neg_psidx(self):
         return ps.from_pandas(self.neg_pidx)
 
+    def test_timedelta_index(self):
+        # Create TimedeltaIndex from constructor
+        psidx = ps.TimedeltaIndex(
+            [
+                timedelta(days=1),
+                timedelta(seconds=1),
+                timedelta(microseconds=1),
+                timedelta(milliseconds=1),
+                timedelta(minutes=1),
+                timedelta(hours=1),
+                timedelta(weeks=1),
+            ],
+            name="x",
+        )
+        self.assert_eq(psidx, self.pidx)
+        # Create TimedeltaIndex from Series
+        self.assert_eq(
+            ps.TimedeltaIndex(ps.Series([timedelta(days=1)])),
+            pd.TimedeltaIndex(pd.Series([timedelta(days=1)])),
+        )
+        # Create TimedeltaIndex from Index
+        self.assert_eq(
+            ps.TimedeltaIndex(ps.Index([timedelta(days=1)])),
+            pd.TimedeltaIndex(pd.Index([timedelta(days=1)])),
+        )
+
+        # ps.TimedeltaIndex(ps.Index([1, 2, 3]))
+        with self.assertRaisesRegexp(TypeError, "Index.name must be a hashable type"):
+            ps.TimedeltaIndex([timedelta(1), timedelta(microseconds=2)], name=[(1, 2)])
+        with self.assertRaisesRegexp(
+            TypeError, "Cannot perform 'all' with this index type: TimedeltaIndex"
+        ):
+            psidx.all()
+
+    @unittest.skipIf(
+        LooseVersion(pd.__version__) >= LooseVersion("2.0.0"),
+        "TODO(SPARK-43705): Enable TimedeltaIndexTests.test_properties for pandas 2.0.0.",
+    )
     def test_properties(self):
         self.assert_eq(self.psidx.days, self.pidx.days)
         self.assert_eq(self.psidx.seconds, self.pidx.seconds)
@@ -71,12 +111,16 @@ class TimedeltaIndexTest(PandasOnSparkTestCase, TestUtils):
         self.assert_eq(self.neg_psidx.microseconds, self.neg_pidx.microseconds)
 
 
+class TimedeltaIndexTests(TimedeltaIndexTestsMixin, PandasOnSparkTestCase, TestUtils):
+    pass
+
+
 if __name__ == "__main__":
     import unittest
     from pyspark.pandas.tests.indexes.test_timedelta import *  # noqa: F401
 
     try:
-        import xmlrunner  # type: ignore[import]
+        import xmlrunner
 
         testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
     except ImportError:

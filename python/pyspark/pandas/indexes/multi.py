@@ -21,8 +21,9 @@ from typing import Any, Callable, Iterator, List, Optional, Tuple, Union, cast, 
 import pandas as pd
 from pandas.api.types import is_hashable, is_list_like  # type: ignore[attr-defined]
 
-from pyspark.sql import functions as F, Column, Window
+from pyspark.sql import functions as F, Column as PySparkColumn, Window
 from pyspark.sql.types import DataType
+from pyspark.sql.utils import get_column_class
 
 # For running doctests and reference resolution in PyCharm.
 from pyspark import pandas as ps
@@ -38,6 +39,7 @@ from pyspark.pandas.utils import (
     name_like_string,
     scol_for,
     verify_temp_column_name,
+    validate_index_loc,
 )
 from pyspark.pandas.internal import (
     InternalField,
@@ -45,7 +47,6 @@ from pyspark.pandas.internal import (
     NATURAL_ORDER_COLUMN_NAME,
     SPARK_INDEX_NAME_FORMAT,
 )
-from pyspark.pandas.spark import functions as SF
 
 
 class MultiIndex(Index):
@@ -136,7 +137,7 @@ class MultiIndex(Index):
         raise TypeError("TypeError: cannot perform __abs__ with this index type: MultiIndex")
 
     def _with_new_scol(
-        self, scol: Column, *, field: Optional[InternalField] = None
+        self, scol: PySparkColumn, *, field: Optional[InternalField] = None
     ) -> "MultiIndex":
         raise NotImplementedError("Not supported for type MultiIndex")
 
@@ -290,7 +291,7 @@ class MultiIndex(Index):
             DataFrame to be converted to MultiIndex.
         names : list-like, optional
             If no names are provided, use the column names, or tuple of column
-            names if the columns is a MultiIndex. If a sequence, overwrite
+            names if the column is a MultiIndex. If a sequence, overwrite
             names with the given sequence.
 
         Returns
@@ -411,10 +412,10 @@ class MultiIndex(Index):
         ----------
         i : int, str, default -2
             First level of index to be swapped. Can pass level name as string.
-            Type of parameters can be mixed.
+            Parameter types can be mixed.
         j : int, str, default -1
             Second level of index to be swapped. Can pass level name as string.
-            Type of parameters can be mixed.
+            Parameter types can be mixed.
 
         Returns
         -------
@@ -497,7 +498,10 @@ class MultiIndex(Index):
     @staticmethod
     def _comparator_for_monotonic_increasing(
         data_type: DataType,
-    ) -> Callable[[Column, Column, Callable[[Column, Column], Column]], Column]:
+    ) -> Callable[
+        [PySparkColumn, PySparkColumn, Callable[[PySparkColumn, PySparkColumn], PySparkColumn]],
+        PySparkColumn,
+    ]:
         return compare_disallow_null
 
     def _is_monotonic(self, order: str) -> bool:
@@ -509,14 +513,15 @@ class MultiIndex(Index):
     def _is_monotonic_increasing(self) -> Series:
         window = Window.orderBy(NATURAL_ORDER_COLUMN_NAME).rowsBetween(-1, -1)
 
-        cond = SF.lit(True)
-        has_not_null = SF.lit(True)
+        cond = F.lit(True)
+        has_not_null = F.lit(True)
+        Column = get_column_class()
         for scol in self._internal.index_spark_columns[::-1]:
             data_type = self._internal.spark_type_for(scol)
             prev = F.lag(scol, 1).over(window)
             compare = MultiIndex._comparator_for_monotonic_increasing(data_type)
             # Since pandas 1.1.4, null value is not allowed at any levels of MultiIndex.
-            # Therefore, we should check `has_not_null` over the all levels.
+            # Therefore, we should check `has_not_null` over all levels.
             has_not_null = has_not_null & scol.isNotNull()
             cond = F.when(scol.eqNullSafe(prev), cond).otherwise(compare(scol, prev, Column.__gt__))
 
@@ -545,20 +550,24 @@ class MultiIndex(Index):
     @staticmethod
     def _comparator_for_monotonic_decreasing(
         data_type: DataType,
-    ) -> Callable[[Column, Column, Callable[[Column, Column], Column]], Column]:
+    ) -> Callable[
+        [PySparkColumn, PySparkColumn, Callable[[PySparkColumn, PySparkColumn], PySparkColumn]],
+        PySparkColumn,
+    ]:
         return compare_disallow_null
 
     def _is_monotonic_decreasing(self) -> Series:
         window = Window.orderBy(NATURAL_ORDER_COLUMN_NAME).rowsBetween(-1, -1)
 
-        cond = SF.lit(True)
-        has_not_null = SF.lit(True)
+        cond = F.lit(True)
+        has_not_null = F.lit(True)
+        Column = get_column_class()
         for scol in self._internal.index_spark_columns[::-1]:
             data_type = self._internal.spark_type_for(scol)
             prev = F.lag(scol, 1).over(window)
             compare = MultiIndex._comparator_for_monotonic_increasing(data_type)
             # Since pandas 1.1.4, null value is not allowed at any levels of MultiIndex.
-            # Therefore, we should check `has_not_null` over the all levels.
+            # Therefore, we should check `has_not_null` over all levels.
             has_not_null = has_not_null & scol.isNotNull()
             cond = F.when(scol.eqNullSafe(prev), cond).otherwise(compare(scol, prev, Column.__lt__))
 
@@ -680,7 +689,7 @@ class MultiIndex(Index):
         """
         # TODO: We might need to handle internal state change.
         # So far, we don't have any functions to change the internal state of MultiIndex except for
-        # series-like operations. In that case, it creates new Index object instead of MultiIndex.
+        # series-like operations. In that case, it creates a new Index object instead of MultiIndex.
         return cast(pd.MultiIndex, super().to_pandas())
 
     def _to_pandas(self) -> pd.MultiIndex:
@@ -745,7 +754,7 @@ class MultiIndex(Index):
 
         Returns
         -------
-        symmetric_difference : MiltiIndex
+        symmetric_difference : MultiIndex
 
         Notes
         -----
@@ -774,7 +783,7 @@ class MultiIndex(Index):
                     (  'lama', 'speed')],
                    )
 
-        You can set names of result Index.
+        You can set names of the result Index.
 
         >>> s1.index.symmetric_difference(s2.index, result_name=['a', 'b'])  # doctest: +SKIP
         MultiIndex([('pandas-on-Spark', 'speed'),
@@ -806,7 +815,7 @@ class MultiIndex(Index):
         sdf_symdiff = sdf_self.union(sdf_other).subtract(sdf_self.intersect(sdf_other))
 
         if sort:
-            sdf_symdiff = sdf_symdiff.sort(*self._internal.index_spark_columns)
+            sdf_symdiff = sdf_symdiff.sort(*self._internal.index_spark_column_names)
 
         internal = InternalFrame(
             spark_frame=sdf_symdiff,
@@ -892,6 +901,70 @@ class MultiIndex(Index):
             data_fields=[],
         )
         return cast(MultiIndex, DataFrame(internal).index)
+
+    def drop_duplicates(self, keep: Union[bool, str] = "first") -> "MultiIndex":
+        """
+        Return MultiIndex with duplicate values removed.
+
+        Parameters
+        ----------
+        keep : {'first', 'last', ``False``}, default 'first'
+            Method to handle dropping duplicates:
+            - 'first' : Drop duplicates except for the first occurrence.
+            - 'last' : Drop duplicates except for the last occurrence.
+            - ``False`` : Drop all duplicates.
+
+        Returns
+        -------
+        deduplicated : MultiIndex
+
+        See Also
+        --------
+        Series.drop_duplicates : Equivalent method on Series.
+        DataFrame.drop_duplicates : Equivalent method on DataFrame.
+
+        Examples
+        --------
+        Generate a MultiIndex with duplicate values.
+
+        >>> arrays = [[1, 2, 3, 1, 2], ["red", "blue", "black", "red", "blue"]]
+        >>> midx = ps.MultiIndex.from_arrays(arrays, names=("number", "color"))
+        >>> midx
+        MultiIndex([(1,   'red'),
+                    (2,  'blue'),
+                    (3, 'black'),
+                    (1,   'red'),
+                    (2,  'blue')],
+                   names=['number', 'color'])
+
+        >>> midx.drop_duplicates()
+        MultiIndex([(1,   'red'),
+                    (2,  'blue'),
+                    (3, 'black')],
+                   names=['number', 'color'])
+
+        >>> midx.drop_duplicates(keep='first')
+        MultiIndex([(1,   'red'),
+                    (2,  'blue'),
+                    (3, 'black')],
+                   names=['number', 'color'])
+
+        >>> midx.drop_duplicates(keep='last')
+        MultiIndex([(3, 'black'),
+                    (1,   'red'),
+                    (2,  'blue')],
+                   names=['number', 'color'])
+
+        >>> midx.drop_duplicates(keep=False)
+        MultiIndex([(3, 'black')],
+                   names=['number', 'color'])
+        """
+        with ps.option_context("compute.default_index_type", "distributed"):
+            # The attached index caused by `reset_index` below is used for sorting only,
+            # and it will be dropped soon,
+            # so we enforce “distributed” default index type
+            psdf = self.to_frame().reset_index(drop=True)
+        return ps.MultiIndex.from_frame(psdf.drop_duplicates(keep=keep).sort_index())
 
     def argmax(self) -> None:
         raise TypeError("reduction operation 'argmax' not allowed for this dtype")
@@ -1016,6 +1089,9 @@ class MultiIndex(Index):
 
         Follows Python list.append semantics for negative values.
 
+        .. versionchanged:: 3.4.0
+           Raise IndexError when loc is out of bounds to follow Pandas 1.4+ behavior
+
         Parameters
         ----------
         loc : int
@@ -1044,20 +1120,8 @@ class MultiIndex(Index):
                     ('c', 'z')],
                    )
         """
-        length = len(self)
-        if loc < 0:
-            loc = loc + length
-            if loc < 0:
-                raise IndexError(
-                    "index {} is out of bounds for axis 0 with size {}".format(
-                        (loc - length), length
-                    )
-                )
-        else:
-            if loc > length:
-                raise IndexError(
-                    "index {} is out of bounds for axis 0 with size {}".format(loc, length)
-                )
+        validate_index_loc(self, loc)
+        loc = loc + len(self) if loc < 0 else loc
 
         index_name: List[Label] = [(name,) for name in self._internal.index_spark_column_names]
         sdf_before = self.to_frame(name=index_name)[:loc]._to_spark()

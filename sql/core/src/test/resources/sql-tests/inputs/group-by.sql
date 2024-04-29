@@ -7,12 +7,6 @@
 CREATE OR REPLACE TEMPORARY VIEW testData AS SELECT * FROM VALUES
 (1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2), (null, 1), (3, null), (null, null)
 AS testData(a, b);
-CREATE OR REPLACE TEMPORARY VIEW testRegression AS SELECT * FROM VALUES
-(1, 10, null), (2, 10, 11), (2, 20, 22), (2, 25, null), (2, 30, 35)
-AS testRegression(k, y, x);
-CREATE OR REPLACE TEMPORARY VIEW aggr AS SELECT * FROM VALUES
-(0, 0), (0, 10), (0, 20), (0, 30), (0, 40), (1, 10), (1, 20), (2, 10), (2, 20), (2, 25), (2, 30), (3, 60), (4, null)
-AS aggr(k, v);
 
 -- Aggregate with empty GroupBy expressions.
 SELECT a, COUNT(b) FROM testData;
@@ -39,6 +33,9 @@ SELECT 'foo', MAX(STRUCT(a)) FROM testData WHERE a = 0 GROUP BY 1;
 SELECT a + b, COUNT(b) FROM testData GROUP BY a + b;
 SELECT a + 2, COUNT(b) FROM testData GROUP BY a + 1;
 SELECT a + 1 + 1, COUNT(b) FROM testData GROUP BY a + 1;
+
+-- struct() in group by
+SELECT count(1) FROM testData GROUP BY struct(a + 0.1 AS aa);
 
 -- Aggregate with nulls.
 SELECT SKEWNESS(a), KURTOSIS(a), MIN(a), MAX(a), AVG(a), VARIANCE(a), STDDEV(a), SUM(a), COUNT(a)
@@ -199,6 +196,7 @@ FROM testData
 GROUP BY a IS NULL;
 
 
+-- Histogram aggregates with different numeric input types
 SELECT
   histogram_numeric(col, 2) as histogram_2,
   histogram_numeric(col, 3) as histogram_3,
@@ -210,12 +208,31 @@ FROM VALUES
  (21), (22), (23), (24), (25), (26), (27), (28), (29), (30),
  (31), (32), (33), (34), (35), (3), (37), (38), (39), (40),
  (41), (42), (43), (44), (45), (46), (47), (48), (49), (50) AS tab(col);
-
--- SPARK-37613: Support ANSI Aggregate Function: regr_count
-SELECT regr_count(y, x) FROM testRegression;
-SELECT regr_count(y, x) FROM testRegression WHERE x IS NOT NULL;
-SELECT k, count(*), regr_count(y, x) FROM testRegression GROUP BY k;
-SELECT k, count(*) FILTER (WHERE x IS NOT NULL), regr_count(y, x) FROM testRegression GROUP BY k;
+SELECT histogram_numeric(col, 3) FROM VALUES (1), (2), (3) AS tab(col);
+SELECT histogram_numeric(col, 3) FROM VALUES (1L), (2L), (3L) AS tab(col);
+SELECT histogram_numeric(col, 3) FROM VALUES (1F), (2F), (3F) AS tab(col);
+SELECT histogram_numeric(col, 3) FROM VALUES (1D), (2D), (3D) AS tab(col);
+SELECT histogram_numeric(col, 3) FROM VALUES (1S), (2S), (3S) AS tab(col);
+SELECT histogram_numeric(col, 3) FROM VALUES
+  (CAST(1 AS BYTE)), (CAST(2 AS BYTE)), (CAST(3 AS BYTE)) AS tab(col);
+SELECT histogram_numeric(col, 3) FROM VALUES
+  (CAST(1 AS TINYINT)), (CAST(2 AS TINYINT)), (CAST(3 AS TINYINT)) AS tab(col);
+SELECT histogram_numeric(col, 3) FROM VALUES
+  (CAST(1 AS SMALLINT)), (CAST(2 AS SMALLINT)), (CAST(3 AS SMALLINT)) AS tab(col);
+SELECT histogram_numeric(col, 3) FROM VALUES
+  (CAST(1 AS BIGINT)), (CAST(2 AS BIGINT)), (CAST(3 AS BIGINT)) AS tab(col);
+SELECT histogram_numeric(col, 3) FROM VALUES (TIMESTAMP '2017-03-01 00:00:00'),
+  (TIMESTAMP '2017-04-01 00:00:00'), (TIMESTAMP '2017-05-01 00:00:00') AS tab(col);
+SELECT histogram_numeric(col, 3) FROM VALUES (INTERVAL '100-00' YEAR TO MONTH),
+  (INTERVAL '110-00' YEAR TO MONTH), (INTERVAL '120-00' YEAR TO MONTH) AS tab(col);
+SELECT histogram_numeric(col, 3) FROM VALUES (INTERVAL '12 20:4:0' DAY TO SECOND),
+  (INTERVAL '12 21:4:0' DAY TO SECOND), (INTERVAL '12 22:4:0' DAY TO SECOND) AS tab(col);
+SELECT histogram_numeric(col, 3)
+FROM VALUES (NULL), (NULL), (NULL) AS tab(col);
+SELECT histogram_numeric(col, 3)
+FROM VALUES (CAST(NULL AS DOUBLE)), (CAST(NULL AS DOUBLE)), (CAST(NULL AS DOUBLE)) AS tab(col);
+SELECT histogram_numeric(col, 3)
+FROM VALUES (CAST(NULL AS INT)), (CAST(NULL AS INT)), (CAST(NULL AS INT)) AS tab(col);
 
 -- SPARK-27974: Support ANSI Aggregate Function: array_agg
 SELECT
@@ -231,15 +248,34 @@ FROM VALUES
   (1,4),(2,3),(1,4),(2,4) AS v(a,b)
 GROUP BY a;
 
--- SPARK-37676: Support ANSI Aggregation Function: percentile_cont
-SELECT
- percentile_cont(0.25) WITHIN GROUP (ORDER BY v),
- percentile_cont(0.25) WITHIN GROUP (ORDER BY v DESC)
-FROM aggr;
-SELECT
-  k,
-  percentile_cont(0.25) WITHIN GROUP (ORDER BY v),
-  percentile_cont(0.25) WITHIN GROUP (ORDER BY v DESC)
-FROM aggr
-GROUP BY k
-ORDER BY k;
+
+SELECT mode(a), mode(b) FROM testData;
+SELECT a, mode(b) FROM testData GROUP BY a ORDER BY a;
+
+
+-- SPARK-44846: PushFoldableIntoBranches in complex grouping expressions cause bindReference error
+SELECT c * 2 AS d
+FROM (
+         SELECT if(b > 1, 1, b) AS c
+         FROM (
+                  SELECT if(a < 0, 0, a) AS b
+                  FROM VALUES (-1), (1), (2) AS t1(a)
+              ) t2
+         GROUP BY b
+     ) t3
+GROUP BY c;
+
+-- SPARK-45599: Check that "weird" doubles group and sort as desired.
+SELECT col1, count(*) AS cnt
+FROM VALUES
+  (0.0),
+  (-0.0),
+  (double('NaN')),
+  (double('NaN')),
+  (double('Infinity')),
+  (double('Infinity')),
+  (-double('Infinity')),
+  (-double('Infinity'))
+GROUP BY col1
+ORDER BY col1
+;

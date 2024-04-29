@@ -246,6 +246,7 @@ private[spark] object JettyUtils extends Logging {
       serverName: String = "",
       poolSize: Int = 200): ServerInfo = {
 
+    logInfo(s"Start Jetty $hostName:$port for $serverName")
     // Start the server first, with no connectors.
     val pool = new QueuedThreadPool(poolSize)
     if (serverName.nonEmpty) {
@@ -310,6 +311,12 @@ private[spark] object JettyUtils extends Logging {
       val requestHeaderSize = conf.get(UI_REQUEST_HEADER_SIZE).toInt
       logDebug(s"Using requestHeaderSize: $requestHeaderSize")
       httpConfig.setRequestHeaderSize(requestHeaderSize)
+
+      // Hide information.
+      logDebug("Using setSendServerVersion: false")
+      httpConfig.setSendServerVersion(false)
+      logDebug("Using setSendXPoweredBy: false")
+      httpConfig.setSendXPoweredBy(false)
 
       // If SSL is configured, create the secure connector first.
       val securePort = sslOptions.createJettySslContextFactory().map { factory =>
@@ -589,11 +596,6 @@ private class ProxyRedirectHandler(_proxyUri: String) extends HandlerWrapper {
     override def sendRedirect(location: String): Unit = {
       val newTarget = if (location != null) {
         val target = new URI(location)
-        val path = if (target.getPath().startsWith("/")) {
-          target.getPath()
-        } else {
-          req.getRequestURI().stripSuffix("/") + "/" + target.getPath()
-        }
         // The target path should already be encoded, so don't re-encode it, just the
         // proxy address part.
         val proxyBase = UIUtils.uiRoot(req)

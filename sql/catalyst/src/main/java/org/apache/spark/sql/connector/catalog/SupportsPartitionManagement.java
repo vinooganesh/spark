@@ -22,7 +22,8 @@ import java.util.Map;
 import org.apache.spark.annotation.Experimental;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.analysis.NoSuchPartitionException;
-import org.apache.spark.sql.catalyst.analysis.PartitionAlreadyExistsException;
+import org.apache.spark.sql.catalyst.analysis.PartitionsAlreadyExistException;
+import org.apache.spark.sql.errors.QueryExecutionErrors;
 import org.apache.spark.sql.types.StructType;
 
 /**
@@ -59,13 +60,13 @@ public interface SupportsPartitionManagement extends Table {
      *
      * @param ident a new partition identifier
      * @param properties the metadata of a partition
-     * @throws PartitionAlreadyExistsException If a partition already exists for the identifier
+     * @throws PartitionsAlreadyExistException If a partition already exists for the identifier
      * @throws UnsupportedOperationException If partition property is not supported
      */
     void createPartition(
         InternalRow ident,
         Map<String, String> properties)
-        throws PartitionAlreadyExistsException, UnsupportedOperationException;
+        throws PartitionsAlreadyExistException, UnsupportedOperationException;
 
     /**
      * Drop a partition from table.
@@ -88,7 +89,7 @@ public interface SupportsPartitionManagement extends Table {
      */
     default boolean purgePartition(InternalRow ident)
       throws NoSuchPartitionException, UnsupportedOperationException {
-      throw new UnsupportedOperationException("Partition purge is not supported");
+      throw QueryExecutionErrors.unsupportedPurgePartitionError();
     }
 
     /**
@@ -147,14 +148,14 @@ public interface SupportsPartitionManagement extends Table {
      * @param to new partition identifier
      * @return true if renaming completes successfully otherwise false
      * @throws UnsupportedOperationException If partition renaming is not supported
-     * @throws PartitionAlreadyExistsException If the `to` partition exists already
+     * @throws PartitionsAlreadyExistException If the `to` partition exists already
      * @throws NoSuchPartitionException If the `from` partition does not exist
      *
      * @since 3.2.0
      */
     default boolean renamePartition(InternalRow from, InternalRow to)
         throws UnsupportedOperationException,
-               PartitionAlreadyExistsException,
+               PartitionsAlreadyExistException,
                NoSuchPartitionException {
       throw new UnsupportedOperationException("Partition renaming is not supported");
     }

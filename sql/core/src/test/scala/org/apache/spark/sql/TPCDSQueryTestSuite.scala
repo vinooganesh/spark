@@ -58,7 +58,6 @@ import org.apache.spark.tags.ExtendedSQLTest
 class TPCDSQueryTestSuite extends QueryTest with TPCDSBase with SQLQueryTestHelper {
 
   private val tpcdsDataPath = sys.env.get("SPARK_TPCDS_DATA")
-  private val regenerateGoldenFiles = sys.env.get("SPARK_GENERATE_GOLDEN_FILES").exists(_ == "1")
 
   // To make output results deterministic
   override protected def sparkConf: SparkConf = super.sparkConf
@@ -108,7 +107,7 @@ class TPCDSQueryTestSuite extends QueryTest with TPCDSBase with SQLQueryTestHelp
     val shouldSortResults = sortMergeJoinConf != conf  // Sort for other joins
     withSQLConf(conf.toSeq: _*) {
       try {
-        val (schema, output) = handleExceptions(getNormalizedResult(spark, query))
+        val (schema, output) = handleExceptions(getNormalizedQueryExecutionResult(spark, query))
         val queryString = query.trim
         val outputString = output.mkString("\n").replaceAll("\\s+$", "")
         if (regenerateGoldenFiles) {

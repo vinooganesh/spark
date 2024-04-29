@@ -42,7 +42,7 @@ private[spark] class DriverLogger(conf: SparkConf) extends Logging {
 
   private val UPLOAD_CHUNK_SIZE = 1024 * 1024
   private val UPLOAD_INTERVAL_IN_SECS = 5
-  private val DEFAULT_LAYOUT = "%d{yy/MM/dd HH:mm:ss.SSS} %t %p %c{1}: %m%n"
+  private val DEFAULT_LAYOUT = "%d{yy/MM/dd HH:mm:ss.SSS} %t %p %c{1}: %m%n%ex"
   private val LOG_FILE_PERMISSIONS = new FsPermission(Integer.parseInt("770", 8).toShort)
 
   private val localLogFile: String = FileUtils.getFile(
@@ -66,7 +66,7 @@ private[spark] class DriverLogger(conf: SparkConf) extends Logging {
       // `AbstractFilterable.Builder.asBuilder()` method will return `Any` in Scala.
       val builder: Log4jFileAppender.Builder[_] = Log4jFileAppender.newBuilder()
       builder.withAppend(false)
-      builder.withBufferedIo(false)
+      builder.setBufferedIo(false)
       builder.setConfiguration(config)
       builder.withFileName(localLogFile)
       builder.setIgnoreExceptions(false)
@@ -126,13 +126,13 @@ private[spark] class DriverLogger(conf: SparkConf) extends Logging {
         throw new RuntimeException(s"${rootDir} does not exist." +
           s" Please create this dir in order to persist driver logs")
       }
-      val dfsLogFile: String = FileUtils.getFile(rootDir, appId
-        + DriverLogger.DRIVER_LOG_FILE_SUFFIX).getAbsolutePath()
+      val dfsLogFile: Path = fileSystem.makeQualified(new Path(rootDir, appId
+        + DriverLogger.DRIVER_LOG_FILE_SUFFIX))
       try {
         inStream = new BufferedInputStream(new FileInputStream(localLogFile))
-        outputStream = SparkHadoopUtil.createFile(fileSystem, new Path(dfsLogFile),
+        outputStream = SparkHadoopUtil.createFile(fileSystem, dfsLogFile,
           conf.get(DRIVER_LOG_ALLOW_EC))
-        fileSystem.setPermission(new Path(dfsLogFile), LOG_FILE_PERMISSIONS)
+        fileSystem.setPermission(dfsLogFile, LOG_FILE_PERMISSIONS)
       } catch {
         case e: Exception =>
           JavaUtils.closeQuietly(inStream)

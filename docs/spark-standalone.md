@@ -8,9 +8,9 @@ license: |
   The ASF licenses this file to You under the Apache License, Version 2.0
   (the "License"); you may not use this file except in compliance with
   the License.  You may obtain a copy of the License at
- 
+
      http://www.apache.org/licenses/LICENSE-2.0
- 
+
   Unless required by applicable law or agreed to in writing, software
   distributed under the License is distributed on an "AS IS" BASIS,
   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -53,8 +53,8 @@ You should see the new node listed there, along with its number of CPUs and memo
 
 Finally, the following configuration options can be passed to the master and worker:
 
-<table class="table">
-  <tr><th style="width:21%">Argument</th><th>Meaning</th></tr>
+<table>
+  <thead><tr><th style="width:21%">Argument</th><th>Meaning</th></tr></thead>
   <tr>
     <td><code>-h HOST</code>, <code>--host HOST</code></td>
     <td>Hostname to listen on</td>
@@ -104,18 +104,20 @@ Once you've set up this file, you can launch or stop your cluster with the follo
 - `sbin/start-master.sh` - Starts a master instance on the machine the script is executed on.
 - `sbin/start-workers.sh` - Starts a worker instance on each machine specified in the `conf/workers` file.
 - `sbin/start-worker.sh` - Starts a worker instance on the machine the script is executed on.
+- `sbin/start-connect-server.sh` - Starts a Spark Connect server on the machine the script is executed on.
 - `sbin/start-all.sh` - Starts both a master and a number of workers as described above.
 - `sbin/stop-master.sh` - Stops the master that was started via the `sbin/start-master.sh` script.
 - `sbin/stop-worker.sh` - Stops all worker instances on the machine the script is executed on.
 - `sbin/stop-workers.sh` - Stops all worker instances on the machines specified in the `conf/workers` file.
+- `sbin/stop-connect-server.sh` - Stops all Spark Connect server instances on the machine the script is executed on.
 - `sbin/stop-all.sh` - Stops both the master and the workers as described above.
 
 Note that these scripts must be executed on the machine you want to run the Spark master on, not your local machine.
 
 You can optionally configure the cluster further by setting environment variables in `conf/spark-env.sh`. Create this file by starting with the `conf/spark-env.sh.template`, and _copy it to all your worker machines_ for the settings to take effect. The following settings are available:
 
-<table class="table">
-  <tr><th style="width:21%">Environment Variable</th><th>Meaning</th></tr>
+<table>
+  <thead><tr><th style="width:21%">Environment Variable</th><th>Meaning</th></tr></thead>
   <tr>
     <td><code>SPARK_MASTER_HOST</code></td>
     <td>Bind the master to a specific hostname or IP address, for example a public one.</td>
@@ -186,8 +188,43 @@ You can optionally configure the cluster further by setting environment variable
 
 SPARK_MASTER_OPTS supports the following system properties:
 
-<table class="table">
-<tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
+<table>
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
+<tr>
+  <td><code>spark.master.ui.port</code></td>
+  <td><code>8080</code></td>
+  <td>
+    Specifies the port number of the Master Web UI endpoint.
+  </td>
+  <td>1.1.0</td>
+</tr>
+<tr>
+  <td><code>spark.master.ui.decommission.allow.mode</code></td>
+  <td><code>LOCAL</code></td>
+  <td>
+    Specifies the behavior of the Master Web UI's /workers/kill endpoint. Possible choices
+    are: <code>LOCAL</code> means allow this endpoint from IP's that are local to the machine running
+    the Master, <code>DENY</code> means to completely disable this endpoint, <code>ALLOW</code> means to allow
+    calling this endpoint from any IP.
+  </td>
+  <td>3.1.0</td>
+</tr>
+<tr>
+  <td><code>spark.master.rest.enabled</code></td>
+  <td><code>false</code></td>
+  <td>
+    Whether to use the Master REST API endpoint or not.
+  </td>
+  <td>1.3.0</td>
+</tr>
+<tr>
+  <td><code>spark.master.rest.port</code></td>
+  <td><code>6066</code></td>
+  <td>
+    Specifies the port number of the Master REST API endpoint.
+  </td>
+  <td>1.3.0</td>
+</tr>
 <tr>
   <td><code>spark.deploy.retainedApplications</code></td>
   <td>200</td>
@@ -252,7 +289,7 @@ SPARK_MASTER_OPTS supports the following system properties:
   <td>0.6.2</td>
 </tr>
 <tr>
-  <td><code>spark.worker.resource.{resourceName}.amount</code></td>
+  <td><code>spark.worker.resource.{name}.amount</code></td>
   <td>(none)</td>
   <td>
     Amount of a particular resource to use on the worker.
@@ -260,7 +297,7 @@ SPARK_MASTER_OPTS supports the following system properties:
   <td>3.0.0</td>
 </tr>
 <tr>
-  <td><code>spark.worker.resource.{resourceName}.discoveryScript</code></td>
+  <td><code>spark.worker.resource.{name}.discoveryScript</code></td>
   <td>(none)</td>
   <td>
     Path to resource discovery script, which is used to find a particular resource while worker starting up.
@@ -273,8 +310,10 @@ SPARK_MASTER_OPTS supports the following system properties:
   <td>(none)</td>
   <td>
     Path to resources file which is used to find various resources while worker starting up.
-    The content of resources file should be formatted like <code>
-    [{"id":{"componentName": "spark.worker","resourceName":"gpu"},"addresses":["0","1","2"]}]</code>.
+    The content of resources file should be formatted like
+    <code>[{"id":{"componentName":</code>
+    <code>"spark.worker", "resourceName":"gpu"},</code>
+    <code>"addresses":["0","1","2"]}]</code>.
     If a particular resource is not found in the resources file, the discovery script would be used to
     find that resource. If the discovery script also does not find the resources, the worker will fail
     to start up.
@@ -285,8 +324,8 @@ SPARK_MASTER_OPTS supports the following system properties:
 
 SPARK_WORKER_OPTS supports the following system properties:
 
-<table class="table">
-<tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
+<table>
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
 <tr>
   <td><code>spark.worker.cleanup.enabled</code></td>
   <td>false</td>
@@ -327,6 +366,16 @@ SPARK_WORKER_OPTS supports the following system properties:
     eventually gets cleaned up.  This config may be removed in the future.
   </td>
   <td>3.0.0</td>
+</tr>
+<tr>
+  <td><code>spark.shuffle.service.db.backend</code></td>
+  <td>LEVELDB</td>
+  <td>
+    When <code>spark.shuffle.service.db.enabled</code> is true, user can use this to specify the kind of disk-based
+    store used in shuffle service state store. This supports `LEVELDB` and `ROCKSDB` now and `LEVELDB` as default value.
+    The original data store in `LevelDB/RocksDB` will not be automatically convert to another kind of storage now.
+  </td>
+  <td>3.4.0</td>
 </tr>
 <tr>
   <td><code>spark.storage.cleanupFilesAfterExecutorExit</code></td>
@@ -378,10 +427,10 @@ You can also pass an option `--total-executor-cores <numCores>` to control the n
 
 # Client Properties
 
-Spark applications supports the following configuration properties specific to standalone mode: 
+Spark applications supports the following configuration properties specific to standalone mode:
 
-<table class="table">
-  <tr><th style="width:21%">Property Name</th><th>Default Value</th><th>Meaning</th><th>Since Version</th></tr>
+<table>
+  <thead><tr><th style="width:21%">Property Name</th><th>Default Value</th><th>Meaning</th><th>Since Version</th></tr></thead>
   <tr>
   <td><code>spark.standalone.submit.waitAppCompletion</code></td>
   <td><code>false</code></td>
@@ -396,6 +445,8 @@ Spark applications supports the following configuration properties specific to s
 
 
 # Launching Spark Applications
+
+## Spark Protocol
 
 The [`spark-submit` script](submitting-applications.html) provides the most straightforward way to
 submit a compiled Spark application to the cluster. For standalone clusters, Spark currently
@@ -418,6 +469,72 @@ failing repeatedly, you may do so through:
     ./bin/spark-class org.apache.spark.deploy.Client kill <master url> <driver ID>
 
 You can find the driver ID through the standalone Master web UI at `http://<master url>:8080`.
+
+## REST API
+
+If `spark.master.rest.enabled` is enabled, Spark master provides additional REST API
+via <code>http://[host:port]/[version]/submissions/[action]</code> where
+<code>host</code> is the master host, and
+<code>port</code> is the port number specified by `spark.master.rest.port` (default: 6066), and 
+<code>version</code> is a protocol version, <code>v1</code> as of today, and
+<code>action</code> is one of the following supported actions.
+
+<table class="table table-striped">
+  <thead><tr><th style="width:21%">Command</th><th>Description</th><th>HTTP METHOD</th><th>Since Version</th></tr></thead>
+  <tr>
+    <td><code>create</code></td>
+    <td>Create a Spark driver via <code>cluster</code> mode.</td>
+    <td>POST</td>
+    <td>1.3.0</td>
+  </tr>
+  <tr>
+    <td><code>kill</code></td>
+    <td>Kill a single Spark driver.</td>
+    <td>POST</td>
+    <td>1.3.0</td>
+  </tr>
+  <tr>
+    <td><code>status</code></td>
+    <td>Check the status of a Spark job.</td>
+    <td>GET</td>
+    <td>1.3.0</td>
+  </tr>
+</table>
+
+The following is a <code>curl</code> CLI command example with the `pi.py` and REST API.
+
+```bash
+$ curl -XPOST http://IP:PORT/v1/submissions/create \
+--header "Content-Type:application/json;charset=UTF-8" \
+--data '{
+  "appResource": "",
+  "sparkProperties": {
+    "spark.master": "spark://master:7077",
+    "spark.app.name": "Spark Pi",
+    "spark.driver.memory": "1g",
+    "spark.driver.cores": "1",
+    "spark.jars": ""
+  },
+  "clientSparkVersion": "",
+  "mainClass": "org.apache.spark.deploy.SparkSubmit",
+  "environmentVariables": { },
+  "action": "CreateSubmissionRequest",
+  "appArgs": [ "/opt/spark/examples/src/main/python/pi.py", "10" ]
+}'
+```
+
+The following is the response from the REST API for the above <code>create</code> request.
+
+```bash
+{
+  "action" : "CreateSubmissionResponse",
+  "message" : "Driver successfully submitted as driver-20231124153531-0000",
+  "serverSparkVersion" : "3.5.1",
+  "submissionId" : "driver-20231124153531-0000",
+  "success" : true
+}
+```
+
 
 # Resource Scheduling
 
@@ -454,6 +571,16 @@ explicitly set, multiple executors from the same application may be launched on 
 if the worker has enough cores and memory. Otherwise, each executor grabs all the cores available
 on the worker by default, in which case only one executor per application may be launched on each
 worker during one single schedule iteration.
+
+# Stage Level Scheduling Overview
+
+Stage level scheduling is supported on Standalone:
+- When dynamic allocation is disabled: It allows users to specify different task resource requirements at the stage level and will use the same executors requested at startup.
+- When dynamic allocation is enabled: Currently, when the Master allocates executors for one application, it will schedule based on the order of the ResourceProfile ids for multiple ResourceProfiles. The ResourceProfile with smaller id will be scheduled firstly. Normally this won’t matter as Spark finishes one stage before starting another one, the only case this might have an affect is in a job server type scenario, so its something to keep in mind. For scheduling, we will only take executor memory and executor cores from built-in executor resources and all other custom resources from a ResourceProfile, other built-in executor resources such as offHeap and memoryOverhead won't take any effect. The base default profile will be created based on the spark configs when you submit an application. Executor memory and executor cores from the base default profile can be propagated to custom ResourceProfiles, but all other custom resources can not be propagated.
+
+## Caveats
+
+As mentioned in [Dynamic Resource Allocation](job-scheduling.html#dynamic-resource-allocation), if cores for each executor is not explicitly specified with dynamic allocation enabled, spark will possibly acquire much more executors than expected. So you are recommended to explicitly set executor cores for each resource profile when using stage level scheduling.
 
 # Monitoring and Logging
 
@@ -519,8 +646,8 @@ ZooKeeper is the best way to go for production-level high availability, but if y
 
 In order to enable this recovery mode, you can set SPARK_DAEMON_JAVA_OPTS in spark-env using this configuration:
 
-<table class="table">
-  <tr><th style="width:21%">System property</th><th>Meaning</th><th>Since Version</th></tr>
+<table>
+  <thead><tr><th style="width:21%">System property</th><th>Meaning</th><th>Since Version</th></tr></thead>
   <tr>
     <td><code>spark.deploy.recoveryMode</code></td>
     <td>Set to FILESYSTEM to enable single-node recovery mode (default: NONE).</td>

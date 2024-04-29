@@ -19,6 +19,7 @@ package org.apache.spark.sql.connector.read;
 
 import org.apache.spark.annotation.Evolving;
 import org.apache.spark.sql.connector.metric.CustomMetric;
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.read.streaming.ContinuousStream;
 import org.apache.spark.sql.connector.read.streaming.MicroBatchStream;
 import org.apache.spark.sql.types.StructType;
@@ -114,5 +115,38 @@ public interface Scan {
    */
   default CustomMetric[] supportedCustomMetrics() {
     return new CustomMetric[]{};
+  }
+
+  /**
+   * Returns an array of custom metrics which are collected with values at the driver side only.
+   * Note that these metrics must be included in the supported custom metrics reported by
+   * `supportedCustomMetrics`.
+   */
+  default CustomTaskMetric[] reportDriverMetrics() {
+    return new CustomTaskMetric[]{};
+  }
+
+  /**
+   * This enum defines how the columnar support for the partitions of the data source
+   * should be determined. The default value is `PARTITION_DEFINED` which indicates that each
+   * partition can determine if it should be columnar or not. SUPPORTED and UNSUPPORTED provide
+   * default shortcuts to indicate support for columnar data or not.
+   *
+   * @since 3.5.0
+   */
+  enum ColumnarSupportMode {
+    PARTITION_DEFINED,
+    SUPPORTED,
+    UNSUPPORTED
+  }
+
+  /**
+   * Subclasses can implement this method to indicate if the support for columnar data should
+   * be determined by each partition or is set as a default for the whole scan.
+   *
+   * @since 3.5.0
+   */
+  default ColumnarSupportMode columnarSupportMode() {
+    return ColumnarSupportMode.PARTITION_DEFINED;
   }
 }

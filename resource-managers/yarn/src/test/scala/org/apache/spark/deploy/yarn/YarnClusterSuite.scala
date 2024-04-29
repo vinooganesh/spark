@@ -29,7 +29,6 @@ import scala.io.Source
 
 import com.google.common.io.{ByteStreams, Files}
 import org.apache.hadoop.yarn.conf.YarnConfiguration
-import org.apache.hadoop.yarn.util.ConverterUtils
 import org.scalatest.concurrent.Eventually._
 import org.scalatest.exceptions.TestFailedException
 import org.scalatest.matchers.must.Matchers
@@ -55,11 +54,12 @@ import org.apache.spark.util.{Utils, YarnContainerInfoHelper}
 @ExtendedYarnTest
 class YarnClusterSuite extends BaseYarnClusterSuite {
 
-  private val pythonExecutablePath = {
+  private val (isPythonAvailable, pythonExecutablePath) = {
     // To make sure to use the same Python executable.
-    val maybePath = TestUtils.getAbsolutePathFromExecutable("python3")
-    assert(maybePath.isDefined)
-    maybePath.get
+    TestUtils.getAbsolutePathFromExecutable("python3") match {
+      case Some(path) => (true, path)
+      case _ => (false, "")
+    }
   }
 
   override def newYarnConfig(): YarnConfiguration = new YarnConfiguration()
@@ -262,6 +262,7 @@ class YarnClusterSuite extends BaseYarnClusterSuite {
   test("monitor app using launcher library") {
     val env = new JHashMap[String, String]()
     env.put("YARN_CONF_DIR", hadoopConfDir.getAbsolutePath())
+    env.put("SPARK_PREFER_IPV6", Utils.preferIPv6.toString)
 
     val propsFile = createConfFile()
     val handle = new SparkLauncher(env)
@@ -371,6 +372,7 @@ class YarnClusterSuite extends BaseYarnClusterSuite {
       clientMode: Boolean,
       extraConf: Map[String, String] = Map(),
       extraEnv: Map[String, String] = Map()): Unit = {
+    assume(isPythonAvailable)
     val primaryPyFile = new File(tempDir, "test.py")
     Files.write(TEST_PYFILE, primaryPyFile, StandardCharsets.UTF_8)
 
@@ -649,7 +651,7 @@ private object YarnClusterDriver extends Logging with Matchers {
           "NM_HTTP_PORT" -> YarnContainerInfoHelper.getNodeManagerHttpPort(container = None),
           "NM_HTTP_ADDRESS" -> YarnContainerInfoHelper.getNodeManagerHttpAddress(container = None),
           "CLUSTER_ID" -> YarnContainerInfoHelper.getClusterId(yarnConf).getOrElse(""),
-          "CONTAINER_ID" -> ConverterUtils.toString(containerId),
+          "CONTAINER_ID" -> YarnContainerInfoHelper.convertToString(containerId),
           "USER" -> user,
           "LOG_FILES" -> "stderr,stdout")
 

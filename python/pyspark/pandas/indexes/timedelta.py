@@ -25,7 +25,6 @@ from pyspark._globals import _NoValue
 from pyspark.pandas.indexes.base import Index
 from pyspark.pandas.missing.indexes import MissingPandasLikeTimedeltaIndex
 from pyspark.pandas.series import Series
-from pyspark.pandas.spark import functions as SF
 from pyspark.sql import functions as F
 
 
@@ -150,9 +149,9 @@ class TimedeltaIndex(Index):
 
         @no_type_check
         def get_seconds(scol):
-            hour_scol = SF.date_part("HOUR", scol)
-            minute_scol = SF.date_part("MINUTE", scol)
-            second_scol = SF.date_part("SECOND", scol)
+            hour_scol = F.date_part(F.lit("HOUR"), scol)
+            minute_scol = F.date_part(F.lit("MINUTE"), scol)
+            second_scol = F.date_part(F.lit("SECOND"), scol)
             return (
                 F.when(
                     hour_scol < 0,
@@ -178,7 +177,7 @@ class TimedeltaIndex(Index):
 
         @no_type_check
         def get_microseconds(scol):
-            second_scol = SF.date_part("SECOND", scol)
+            second_scol = F.date_part(F.lit("SECOND"), scol)
             return (
                 (
                     F.when(
@@ -192,3 +191,7 @@ class TimedeltaIndex(Index):
             ).cast("int")
 
         return Index(self.to_series().spark.transform(get_microseconds))
+
+    @no_type_check
+    def all(self, *args, **kwargs) -> None:
+        raise TypeError("Cannot perform 'all' with this index type: %s" % type(self).__name__)

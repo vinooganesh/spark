@@ -23,6 +23,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.plans.physical.SinglePartition
 import org.apache.spark.sql.execution.{ShufflePartitionSpec, SparkPlan, UnaryExecNode, UnionExec}
 import org.apache.spark.sql.execution.exchange.{ENSURE_REQUIREMENTS, REBALANCE_PARTITIONS_BY_COL, REBALANCE_PARTITIONS_BY_NONE, REPARTITION_BY_COL, ShuffleExchangeLike, ShuffleOrigin}
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, CartesianProductExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
 
@@ -64,20 +65,10 @@ case class CoalesceShufflePartitions(session: SparkSession) extends AQEShuffleRe
         1
       }
     }
-    val advisoryTargetSize = conf.getConf(SQLConf.ADVISORY_PARTITION_SIZE_IN_BYTES)
-    val minPartitionSize = if (Utils.isTesting) {
-      // In the tests, we usually set the target size to a very small value that is even smaller
-      // than the default value of the min partition size. Here we also adjust the min partition
-      // size to be not larger than 20% of the target size, so that the tests don't need to set
-      // both configs all the time to check the coalescing behavior.
-      conf.getConf(SQLConf.COALESCE_PARTITIONS_MIN_PARTITION_SIZE).min(advisoryTargetSize / 5)
-    } else {
-      conf.getConf(SQLConf.COALESCE_PARTITIONS_MIN_PARTITION_SIZE)
-    }
 
-    // Sub-plans under the Union operator can be coalesced independently, so we can divide them
-    // into independent "coalesce groups", and all shuffle stages within each group have to be
-    // coalesced together.
+    // Sub-plans under the Union/CartesianProduct/BroadcastHashJoin/BroadcastNestedLoopJoin
+    // operator can be coalesced independently, so we can divide them into independent
+    // "coalesce groups", and all shuffle stages within each group have to be coalesced together.
     val coalesceGroups = collectCoalesceGroups(plan)
 
     // Divide minimum task parallelism among coalesce groups according to their data sizes.
@@ -100,6 +91,17 @@ case class CoalesceShufflePartitions(session: SparkSession) extends AQEShuffleRe
     val specsMap = mutable.HashMap.empty[Int, Seq[ShufflePartitionSpec]]
     // Coalesce partitions for each coalesce group independently.
     coalesceGroups.zip(minNumPartitionsByGroup).foreach { case (shuffleStages, minNumPartitions) =>
+      val advisoryTargetSize = advisoryPartitionSize(shuffleStages)
+      val minPartitionSize = if (Utils.isTesting) {
+        // In the tests, we usually set the target size to a very small value that is even smaller
+        // than the default value of the min partition size. Here we also adjust the min partition
+        // size to be not larger than 20% of the target size, so that the tests don't need to set
+        // both configs all the time to check the coalescing behavior.
+        conf.getConf(SQLConf.COALESCE_PARTITIONS_MIN_PARTITION_SIZE).min(advisoryTargetSize / 5)
+      } else {
+        conf.getConf(SQLConf.COALESCE_PARTITIONS_MIN_PARTITION_SIZE)
+      }
+
       val newPartitionSpecs = ShufflePartitionsUtil.coalescePartitions(
         shuffleStages.map(_.shuffleStage.mapStats),
         shuffleStages.map(_.partitionSpecs),
@@ -121,10 +123,24 @@ case class CoalesceShufflePartitions(session: SparkSession) extends AQEShuffleRe
     }
   }
 
+  // data sources may request a particular advisory partition size for the final write stage
+  // if it happens, the advisory partition size will be set in ShuffleQueryStageExec
+  // only one shuffle stage is expected in such cases
+  private def advisoryPartitionSize(shuffleStages: Seq[ShuffleStageInfo]): Long = {
+    val defaultAdvisorySize = conf.getConf(SQLConf.ADVISORY_PARTITION_SIZE_IN_BYTES)
+    shuffleStages match {
+      case Seq(stage) =>
+        stage.shuffleStage.advisoryPartitionSize.getOrElse(defaultAdvisorySize)
+      case _ =>
+        defaultAdvisorySize
+    }
+  }
+
   /**
-   * Gather all coalesce-able groups such that the shuffle stages in each child of a Union operator
-   * are in their independent groups if:
-   * 1) all leaf nodes of this child are shuffle stages; and
+   * Gather all coalesce-able groups such that the shuffle stages in each child of a
+   * Union/CartesianProduct/BroadcastHashJoin/BroadcastNestedLoopJoin operator are in their
+   * independent groups if:
+   * 1) all leaf nodes of this child are exchange stages; and
    * 2) all these shuffle stages support coalescing.
    */
   private def collectCoalesceGroups(plan: SparkPlan): Seq[Seq[ShuffleStageInfo]] = plan match {
@@ -132,10 +148,17 @@ case class CoalesceShufflePartitions(session: SparkSession) extends AQEShuffleRe
       Seq(collectShuffleStageInfos(r))
     case unary: UnaryExecNode => collectCoalesceGroups(unary.child)
     case union: UnionExec => union.children.flatMap(collectCoalesceGroups)
-    // If not all leaf nodes are query stages, it's not safe to reduce the number of shuffle
-    // partitions, because we may break the assumption that all children of a spark plan have
-    // same number of output partitions.
-    case p if p.collectLeaves().forall(_.isInstanceOf[QueryStageExec]) =>
+    case join: CartesianProductExec => join.children.flatMap(collectCoalesceGroups)
+    // Note that, `BroadcastQueryStageExec` is a valid case:
+    // If a join has been optimized from shuffled join to broadcast join, then the one side is
+    // `BroadcastQueryStageExec` and other side is `ShuffleQueryStageExec`. It can coalesce the
+    // shuffle side as we do not expect broadcast exchange has same partition number.
+    case join: BroadcastHashJoinExec => join.children.flatMap(collectCoalesceGroups)
+    case join: BroadcastNestedLoopJoinExec => join.children.flatMap(collectCoalesceGroups)
+    // If not all leaf nodes are exchange query stages, it's not safe to reduce the number of
+    // shuffle partitions, because we may break the assumption that all children of a spark plan
+    // have same number of output partitions.
+    case p if p.collectLeaves().forall(_.isInstanceOf[ExchangeQueryStageExec]) =>
       val shuffleStages = collectShuffleStageInfos(p)
       // ShuffleExchanges introduced by repartition do not support partition number change.
       // We change the number of partitions only if all the ShuffleExchanges support it.

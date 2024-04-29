@@ -165,9 +165,10 @@ class BlockManagerDecommissionIntegrationSuite extends SparkFunSuite with LocalS
       }
       x.map(y => (y, y))
     }
-    val testRdd = shuffle match {
-      case true => baseRdd.reduceByKey(_ + _)
-      case false => baseRdd
+    val testRdd = if (shuffle) {
+      baseRdd.reduceByKey(_ + _)
+    } else {
+      baseRdd
     }
 
     // Listen for the job & block updates
@@ -182,9 +183,14 @@ class BlockManagerDecommissionIntegrationSuite extends SparkFunSuite with LocalS
       taskEndEvents.asScala.filter(_.taskInfo.successful).map(_.taskInfo.executorId).headOption
     }
 
-    sc.addSparkListener(new SparkListener {
+    val listener = new SparkListener {
+      var removeReasonValidated = false
+
       override def onExecutorRemoved(execRemoved: SparkListenerExecutorRemoved): Unit = {
         executorRemovedSem.release()
+        if (execRemoved.reason == ExecutorDecommission.msgPrefix + "test msg 0") {
+          removeReasonValidated = true
+        }
       }
 
       override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = {
@@ -210,7 +216,8 @@ class BlockManagerDecommissionIntegrationSuite extends SparkFunSuite with LocalS
           }
         }
       }
-    })
+    }
+    sc.addSparkListener(listener)
 
     // Cache the RDD lazily
     if (persist) {
@@ -246,7 +253,7 @@ class BlockManagerDecommissionIntegrationSuite extends SparkFunSuite with LocalS
     // Decommission executor and ensure it is not relaunched by setting adjustTargetNumExecutors
     sched.decommissionExecutor(
       execToDecommission,
-      ExecutorDecommissionInfo("", None),
+      ExecutorDecommissionInfo("test msg 0", None),
       adjustTargetNumExecutors = true)
     val decomTime = new SystemClock().getTimeMillis()
 
@@ -342,5 +349,7 @@ class BlockManagerDecommissionIntegrationSuite extends SparkFunSuite with LocalS
     // should have same value like before
     assert(testRdd.count() === numParts)
     assert(accum.value === numParts)
+    import scala.language.reflectiveCalls
+    assert(listener.removeReasonValidated)
   }
 }

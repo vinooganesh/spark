@@ -22,7 +22,7 @@ import java.net.{InetAddress, UnknownHostException, URI, URL}
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
-import java.util.{Locale, Properties, UUID}
+import java.util.{Collections, Locale, Properties, UUID}
 import java.util.zip.{ZipEntry, ZipOutputStream}
 
 import scala.collection.JavaConverters._
@@ -38,7 +38,6 @@ import org.apache.hadoop.io.{DataOutputBuffer, Text}
 import org.apache.hadoop.mapreduce.MRJobConfig
 import org.apache.hadoop.security.UserGroupInformation
 import org.apache.hadoop.util.StringUtils
-import org.apache.hadoop.util.VersionInfo
 import org.apache.hadoop.yarn.api._
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment
 import org.apache.hadoop.yarn.api.protocolrecords._
@@ -54,6 +53,7 @@ import org.apache.spark.api.python.PythonUtils
 import org.apache.spark.deploy.{SparkApplication, SparkHadoopUtil}
 import org.apache.spark.deploy.security.HadoopDelegationTokenManager
 import org.apache.spark.deploy.yarn.ResourceRequestHelper._
+import org.apache.spark.deploy.yarn.YarnSparkHadoopUtil._
 import org.apache.spark.deploy.yarn.config._
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
@@ -61,7 +61,7 @@ import org.apache.spark.internal.config.Python._
 import org.apache.spark.launcher.{JavaModuleOptions, LauncherBackend, SparkAppHandle, YarnCommandBuilderUtils}
 import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.rpc.RpcEnv
-import org.apache.spark.util.{CallerContext, Utils, VersionUtils, YarnContainerInfoHelper}
+import org.apache.spark.util.{CallerContext, Utils, YarnContainerInfoHelper}
 
 private[spark] class Client(
     val args: ClientArguments,
@@ -70,20 +70,21 @@ private[spark] class Client(
   extends Logging {
 
   import Client._
-  import YarnSparkHadoopUtil._
 
   private val yarnClient = YarnClient.createYarnClient
   private val hadoopConf = new YarnConfiguration(SparkHadoopUtil.newConfiguration(sparkConf))
 
   private val isClusterMode = sparkConf.get(SUBMIT_DEPLOY_MODE) == "cluster"
 
-  // ContainerLaunchContext.setTokensConf is only available in Hadoop 2.9+ and 3.x, so here we use
-  // reflection to avoid compilation for Hadoop 2.7 profile.
-  private val SET_TOKENS_CONF_METHOD = "setTokensConf"
-
   private val isClientUnmanagedAMEnabled = sparkConf.get(YARN_UNMANAGED_AM) && !isClusterMode
   private var appMaster: ApplicationMaster = _
   private var stagingDirPath: Path = _
+
+  private val amMemoryOverheadFactor = if (isClusterMode) {
+    sparkConf.get(DRIVER_MEMORY_OVERHEAD_FACTOR)
+  } else {
+    AM_MEMORY_OVERHEAD_FACTOR
+  }
 
   // AM related configurations
   private val amMemory = if (isClusterMode) {
@@ -94,7 +95,7 @@ private[spark] class Client(
   private val amMemoryOverhead = {
     val amMemoryOverheadEntry = if (isClusterMode) DRIVER_MEMORY_OVERHEAD else AM_MEMORY_OVERHEAD
     sparkConf.get(amMemoryOverheadEntry).getOrElse(
-      math.max((MEMORY_OVERHEAD_FACTOR * amMemory).toLong,
+      math.max((amMemoryOverheadFactor * amMemory).toLong,
         ResourceProfile.MEMORY_OVERHEAD_MIN_MIB)).toInt
   }
   private val amCores = if (isClusterMode) {
@@ -107,8 +108,10 @@ private[spark] class Client(
   private val executorMemory = sparkConf.get(EXECUTOR_MEMORY)
   // Executor offHeap memory in MiB.
   protected val executorOffHeapMemory = Utils.executorOffHeapMemorySizeAsMb(sparkConf)
+
+  private val executorMemoryOvereadFactor = sparkConf.get(EXECUTOR_MEMORY_OVERHEAD_FACTOR)
   private val executorMemoryOverhead = sparkConf.get(EXECUTOR_MEMORY_OVERHEAD).getOrElse(
-    math.max((MEMORY_OVERHEAD_FACTOR * executorMemory).toLong,
+    math.max((executorMemoryOvereadFactor * executorMemory).toLong,
       ResourceProfile.MEMORY_OVERHEAD_MIN_MIB)).toInt
 
   private val isPython = sparkConf.get(IS_PYTHON_APP)
@@ -183,8 +186,10 @@ private[spark] class Client(
       yarnClient.init(hadoopConf)
       yarnClient.start()
 
-      logInfo("Requesting a new application from cluster with %d NodeManagers"
-        .format(yarnClient.getYarnClusterMetrics.getNumNodeManagers))
+      if (log.isDebugEnabled) {
+        logDebug("Requesting a new application from cluster with %d NodeManagers"
+          .format(yarnClient.getYarnClusterMetrics.getNumNodeManagers))
+      }
 
       // Get a new application from our RM
       val newApp = yarnClient.createApplication()
@@ -284,7 +289,7 @@ private[spark] class Client(
     }
 
     val capability = Records.newRecord(classOf[Resource])
-    capability.setMemory(amMemory + amMemoryOverhead)
+    capability.setMemorySize(amMemory + amMemoryOverhead)
     capability.setVirtualCores(amCores)
     if (amResources.nonEmpty) {
       ResourceRequestHelper.setResourceRequests(amResources, capability)
@@ -299,7 +304,7 @@ private[spark] class Client(
         amRequest.setCapability(capability)
         amRequest.setNumContainers(1)
         amRequest.setNodeLabelExpression(expr)
-        appContext.setAMContainerResourceRequest(amRequest)
+        appContext.setAMContainerResourceRequests(Collections.singletonList(amRequest))
       case None =>
         appContext.setResource(capability)
     }
@@ -352,36 +357,20 @@ private[spark] class Client(
   private def setTokenConf(amContainer: ContainerLaunchContext): Unit = {
     // SPARK-37205: this regex is used to grep a list of configurations and send them to YARN RM
     // for fetching delegation tokens. See YARN-5910 for more details.
-    val regex = sparkConf.get(config.AM_TOKEN_CONF_REGEX)
-    // The feature is only supported in Hadoop 2.9+ and 3.x, hence the check below.
-    val isSupported = VersionUtils.majorMinorVersion(VersionInfo.getVersion) match {
-      case (2, n) if n >= 9 => true
-      case (3, _) => true
-      case _ => false
-    }
-    if (regex.nonEmpty && isSupported) {
+    sparkConf.get(config.AM_TOKEN_CONF_REGEX).foreach { regex =>
       logInfo(s"Processing token conf (spark.yarn.am.tokenConfRegex) with regex $regex")
-      val dob = new DataOutputBuffer();
-      val copy = new Configuration(false);
-      copy.clear();
+      val dob = new DataOutputBuffer()
+      val copy = new Configuration(false)
+      copy.clear()
       hadoopConf.asScala.foreach { entry =>
-        if (entry.getKey.matches(regex.get)) {
+        if (entry.getKey.matches(regex)) {
           copy.set(entry.getKey, entry.getValue)
           logInfo(s"Captured key: ${entry.getKey} -> value: ${entry.getValue}")
         }
       }
       copy.write(dob);
 
-      // since this method was added in Hadoop 2.9 and 3.0, we use reflection here to avoid
-      // compilation error for Hadoop 2.7 profile.
-      val setTokensConfMethod = try {
-        amContainer.getClass.getMethod(SET_TOKENS_CONF_METHOD, classOf[ByteBuffer])
-      } catch {
-        case _: NoSuchMethodException =>
-          throw new SparkException(s"Cannot find setTokensConf method in ${amContainer.getClass}." +
-              s" Please check YARN version and make sure it is 2.9+ or 3.x")
-      }
-      setTokensConfMethod.invoke(ByteBuffer.wrap(dob.getData))
+      amContainer.setTokensConf(ByteBuffer.wrap(dob.getData))
     }
   }
 
@@ -400,7 +389,7 @@ private[spark] class Client(
    * Fail fast if we have requested more resources per container than is available in the cluster.
    */
   private def verifyClusterResources(newAppResponse: GetNewApplicationResponse): Unit = {
-    val maxMem = newAppResponse.getMaximumResourceCapability().getMemory()
+    val maxMem = newAppResponse.getMaximumResourceCapability.getMemorySize
     logInfo("Verifying our application has not requested more than the maximum " +
       s"memory capability of the cluster ($maxMem MB per container)")
     val executorMem =
@@ -902,6 +891,7 @@ private[spark] class Client(
     populateClasspath(args, hadoopConf, sparkConf, env, sparkConf.get(DRIVER_CLASS_PATH))
     env("SPARK_YARN_STAGING_DIR") = stagingDirPath.toString
     env("SPARK_USER") = UserGroupInformation.getCurrentUser().getShortUserName()
+    env("SPARK_PREFER_IPV6") = Utils.preferIPv6.toString
 
     // Pick up any environment variables for the AM provided through spark.yarn.appMasterEnv.*
     val amEnvPrefix = "spark.yarn.appMasterEnv."
@@ -977,6 +967,8 @@ private[spark] class Client(
 
     val javaOpts = ListBuffer[String]()
 
+    javaOpts += s"-Djava.net.preferIPv6Addresses=${Utils.preferIPv6}"
+
     // SPARK-37106: To start AM with Java 17, `JavaModuleOptions.defaultModuleOptions`
     // is added by default. It will not affect Java 8 and Java 11 due to existence of
     // `-XX:+IgnoreUnrecognizedVMOptions`.
@@ -991,26 +983,6 @@ private[spark] class Client(
 
     val tmpDir = new Path(Environment.PWD.$$(), YarnConfiguration.DEFAULT_CONTAINER_TEMP_DIR)
     javaOpts += "-Djava.io.tmpdir=" + tmpDir
-
-    // TODO: Remove once cpuset version is pushed out.
-    // The context is, default gc for server class machines ends up using all cores to do gc -
-    // hence if there are multiple containers in same node, Spark GC affects all other containers'
-    // performance (which can be that of other Spark containers)
-    // Instead of using this, rely on cpusets by YARN to enforce "proper" Spark behavior in
-    // multi-tenant environments. Not sure how default Java GC behaves if it is limited to subset
-    // of cores on a node.
-    val useConcurrentAndIncrementalGC = launchEnv.get("SPARK_USE_CONC_INCR_GC").exists(_.toBoolean)
-    if (useConcurrentAndIncrementalGC) {
-      // In our expts, using (default) throughput collector has severe perf ramifications in
-      // multi-tenant machines
-      javaOpts += "-XX:+UseConcMarkSweepGC"
-      javaOpts += "-XX:MaxTenuringThreshold=31"
-      javaOpts += "-XX:SurvivorRatio=8"
-      javaOpts += "-XX:+CMSIncrementalMode"
-      javaOpts += "-XX:+CMSIncrementalPacing"
-      javaOpts += "-XX:CMSIncrementalDutyCycleMin=0"
-      javaOpts += "-XX:CMSIncrementalDutyCycle=10"
-    }
 
     // Include driver-specific java options if we are launching a driver
     if (isClusterMode) {
@@ -1149,6 +1121,8 @@ private[spark] class Client(
       logApplicationReport: Boolean = true,
       interval: Long = sparkConf.get(REPORT_INTERVAL)): YarnAppReport = {
     var lastState: YarnApplicationState = null
+    val reportsTillNextLog: Int = sparkConf.get(REPORT_LOG_FREQUENCY)
+    var reportsSinceLastLog: Int = 0
     while (true) {
       Thread.sleep(interval)
       val report: ApplicationReport =
@@ -1167,9 +1141,12 @@ private[spark] class Client(
               Some(msg))
         }
       val state = report.getYarnApplicationState
-
+      reportsSinceLastLog += 1
       if (logApplicationReport) {
-        logInfo(s"Application report for $appId (state: $state)")
+        if (lastState != state || reportsSinceLastLog >= reportsTillNextLog) {
+          logInfo(s"Application report for $appId (state: $state)")
+          reportsSinceLastLog = 0
+        }
 
         // If DEBUG is enabled, log report details every iteration
         // Otherwise, log them every time the application changes state
@@ -1457,6 +1434,11 @@ private[spark] object Client extends Logging {
       addClasspathEntry(getClusterPath(sparkConf, cp), env)
     }
 
+    val cpSet = extraClassPath match {
+      case Some(classPath) if Utils.isTesting => classPath.split(File.pathSeparator).toSet
+      case _ => Set.empty[String]
+    }
+
     addClasspathEntry(Environment.PWD.$$(), env)
 
     addClasspathEntry(Environment.PWD.$$() + Path.SEPARATOR + LOCALIZED_CONF_DIR, env)
@@ -1500,7 +1482,13 @@ private[spark] object Client extends Logging {
     }
 
     sys.env.get(ENV_DIST_CLASSPATH).foreach { cp =>
-      addClasspathEntry(getClusterPath(sparkConf, cp), env)
+      // SPARK-40635: during the test, add a jar de-duplication process to avoid
+      // that the startup command can't be executed due to the too long classpath.
+      val newCp = if (Utils.isTesting) {
+        cp.split(File.pathSeparator)
+          .filterNot(cpSet.contains).mkString(File.pathSeparator)
+      } else cp
+      addClasspathEntry(getClusterPath(sparkConf, newCp), env)
     }
 
     // Add the localized Hadoop config at the end of the classpath, in case it contains other

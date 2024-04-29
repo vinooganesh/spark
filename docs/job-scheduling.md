@@ -57,7 +57,7 @@ Resource allocation can be configured as follows, based on the cluster type:
   on the cluster (`spark.executor.instances` as configuration property), while `--executor-memory`
   (`spark.executor.memory` configuration property) and `--executor-cores` (`spark.executor.cores` configuration
   property) control the resources per executor. For more information, see the
-  [YARN Spark Properties](running-on-yarn.html).
+  [YARN Spark Properties](running-on-yarn.html#spark-properties).
 
 A second option available on Mesos is _dynamic sharing_ of CPU cores. In this mode, each Spark application
 still has a fixed and independent memory allocation (set by `spark.executor.memory`), but when the
@@ -83,13 +83,21 @@ This feature is disabled by default and available on all coarse-grained cluster 
 [Mesos coarse-grained mode](running-on-mesos.html#mesos-run-modes) and [K8s mode](running-on-kubernetes.html).
 
 
+### Caveats
+
+- In [standalone mode](spark-standalone.html), without explicitly setting `spark.executor.cores`, each executor will get all the available cores of a worker. In this case, when dynamic allocation enabled, spark will possibly acquire much more executors than expected. When you want to use dynamic allocation in [standalone mode](spark-standalone.html), you are recommended to explicitly set cores for each executor before the issue [SPARK-30299](https://issues.apache.org/jira/browse/SPARK-30299) got fixed.
+
 ### Configuration and Setup
 
-There are two ways for using this feature.
-First, your application must set both `spark.dynamicAllocation.enabled` and `spark.dynamicAllocation.shuffleTracking.enabled` to `true`.
-Second, your application must set both `spark.dynamicAllocation.enabled` and `spark.shuffle.service.enabled` to `true`
-after you set up an *external shuffle service* on each worker node in the same cluster.
-The purpose of the shuffle tracking or the external shuffle service is to allow executors to be removed
+There are several ways for using this feature.
+Regardless of which approach you choose, your application must set `spark.dynamicAllocation.enabled` to `true` first, additionally, 
+
+- your application must set `spark.shuffle.service.enabled` to `true` after you set up an *external shuffle service* on each worker node in the same cluster, or
+- your application must set `spark.dynamicAllocation.shuffleTracking.enabled` to `true`, or
+- your application must set both `spark.decommission.enabled` and `spark.storage.decommission.shuffleBlocks.enabled` to `true`, or
+- your application must configure `spark.shuffle.sort.io.plugin.class` to use a custom `ShuffleDataIO` who's `ShuffleDriverComponents` supports reliable storage.
+
+The purpose of the external shuffle service or the shuffle tracking or the `ShuffleDriverComponents` supports reliable storage is to allow executors to be removed
 without deleting shuffle files written by them (more detail described
 [below](job-scheduling.html#graceful-decommission-of-executors)). While it is simple to enable shuffle tracking, the way to set up the external shuffle service varies across cluster managers:
 
@@ -191,6 +199,9 @@ of cluster resources. This means that short jobs submitted while a long job is r
 resources right away and still get good response times, without waiting for the long job to finish. This
 mode is best for multi-user settings.
 
+This feature is disabled by default and available on all coarse-grained cluster managers, i.e.
+[standalone mode](spark-standalone.html), [YARN mode](running-on-yarn.html),
+[K8s mode](running-on-kubernetes.html) and [Mesos coarse-grained mode](running-on-mesos.html#mesos-run-modes).
 To enable the fair scheduler, simply set the `spark.scheduler.mode` property to `FAIR` when configuring
 a SparkContext:
 
@@ -304,5 +315,5 @@ via `sc.setJobGroup` in a separate PVM thread, which also disallows to cancel th
 later.
 
 `pyspark.InheritableThread` is recommended to use together for a PVM thread to inherit the inheritable attributes
- such as local properties in a JVM thread, and to avoid resource leak.
+ such as local properties in a JVM thread.
 

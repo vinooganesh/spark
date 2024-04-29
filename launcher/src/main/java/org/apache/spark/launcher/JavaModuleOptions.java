@@ -21,6 +21,8 @@ package org.apache.spark.launcher;
  * This helper class is used to place the all `--add-opens` options
  * required by Spark when using Java 17. `DEFAULT_MODULE_OPTIONS` has added
  * `-XX:+IgnoreUnrecognizedVMOptions` to be compatible with Java 8 and Java 11.
+ *
+ * @since 3.3.0
  */
 public class JavaModuleOptions {
     private static final String[] DEFAULT_MODULE_OPTIONS = {
@@ -34,11 +36,13 @@ public class JavaModuleOptions {
       "--add-opens=java.base/java.util=ALL-UNNAMED",
       "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
       "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED",
+      "--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED",
       "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
       "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED",
       "--add-opens=java.base/sun.security.action=ALL-UNNAMED",
       "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED",
-      "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED"};
+      "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED",
+      "-Djdk.reflect.useDirectMethodHandle=false"};
 
     /**
      * Returns the default Java options related to `--add-opens' and

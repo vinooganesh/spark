@@ -23,6 +23,7 @@ import java.sql.Date;
 import java.sql.Timestamp;
 import java.time.*;
 import java.util.*;
+import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
 
 import org.apache.spark.api.java.Optional;
@@ -41,6 +42,7 @@ import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.*;
 import org.apache.spark.sql.*;
+import static org.apache.spark.sql.RowFactory.create;
 import org.apache.spark.sql.catalyst.encoders.OuterScopes;
 import org.apache.spark.sql.catalyst.expressions.GenericRow;
 import org.apache.spark.sql.test.TestSparkSession;
@@ -279,7 +281,7 @@ public class JavaDatasetSuite implements Serializable {
     Assert.assertTrue(prevState.isUpdated());
     Assert.assertFalse(prevState.isRemoved());
     Assert.assertTrue(prevState.exists());
-    Assert.assertEquals(new Integer(9), prevState.get());
+    Assert.assertEquals(Integer.valueOf(9), prevState.get());
     Assert.assertEquals(0L, prevState.getCurrentProcessingTimeMs());
     Assert.assertEquals(1000L, prevState.getCurrentWatermarkMs());
     Assert.assertEquals(Optional.of(1500L), prevState.getTimeoutTimestampMs());
@@ -289,7 +291,7 @@ public class JavaDatasetSuite implements Serializable {
     Assert.assertTrue(prevState.isUpdated());
     Assert.assertFalse(prevState.isRemoved());
     Assert.assertTrue(prevState.exists());
-    Assert.assertEquals(new Integer(18), prevState.get());
+    Assert.assertEquals(Integer.valueOf(18), prevState.get());
 
     prevState = TestGroupState.create(
       Optional.of(9), GroupStateTimeout.EventTimeTimeout(), 0L, Optional.of(1000L), true);
@@ -302,7 +304,7 @@ public class JavaDatasetSuite implements Serializable {
   }
 
   @Test
-  public void testGroupBy() {
+  public void testGroupByKey() {
     List<String> data = Arrays.asList("a", "foo", "bar");
     Dataset<String> ds = spark.createDataset(data, Encoders.STRING());
     KeyValueGroupedDataset<Integer, String> grouped =
@@ -327,9 +329,21 @@ public class JavaDatasetSuite implements Serializable {
           }
           return Collections.singletonList(sb.toString()).iterator();
         },
-      Encoders.STRING());
+        Encoders.STRING());
 
     Assert.assertEquals(asSet("1a", "3foobar"), toSet(flatMapped.collectAsList()));
+    Dataset<String> flatMapSorted = grouped.flatMapSortedGroups(
+        new Column[] { ds.col("value") },
+        (FlatMapGroupsFunction<Integer, String, String>) (key, values) -> {
+          StringBuilder sb = new StringBuilder(key.toString());
+          while (values.hasNext()) {
+            sb.append(values.next());
+          }
+          return Collections.singletonList(sb.toString()).iterator();
+        },
+        Encoders.STRING());
+
+    Assert.assertEquals(asSet("1a", "3barfoo"), toSet(flatMapSorted.collectAsList()));
 
     Dataset<String> mapped2 = grouped.mapGroupsWithState(
         (MapGroupsWithStateFunction<Integer, String, Long, String>) (key, values, s) -> {
@@ -352,10 +366,10 @@ public class JavaDatasetSuite implements Serializable {
           }
           return Collections.singletonList(sb.toString()).iterator();
         },
-      OutputMode.Append(),
-      Encoders.LONG(),
-      Encoders.STRING(),
-      GroupStateTimeout.NoTimeout());
+        OutputMode.Append(),
+        Encoders.LONG(),
+        Encoders.STRING(),
+        GroupStateTimeout.NoTimeout());
 
     Assert.assertEquals(asSet("1a", "3foobar"), toSet(flatMapped2.collectAsList()));
 
@@ -366,7 +380,7 @@ public class JavaDatasetSuite implements Serializable {
       asSet(tuple2(1, "a"), tuple2(3, "foobar")),
       toSet(reduced.collectAsList()));
 
-    List<Integer> data2 = Arrays.asList(2, 6, 10);
+    List<Integer> data2 = Arrays.asList(2, 6, 7, 10);
     Dataset<Integer> ds2 = spark.createDataset(data2, Encoders.INT());
     KeyValueGroupedDataset<Integer, Integer> grouped2 = ds2.groupByKey(
         (MapFunction<Integer, Integer>) v -> v / 2,
@@ -387,7 +401,26 @@ public class JavaDatasetSuite implements Serializable {
       },
       Encoders.STRING());
 
-    Assert.assertEquals(asSet("1a#2", "3foobar#6", "5#10"), toSet(cogrouped.collectAsList()));
+    Assert.assertEquals(asSet("1a#2", "3foobar#67", "5#10"), toSet(cogrouped.collectAsList()));
+
+    Dataset<String> cogroupSorted = grouped.cogroupSorted(
+      grouped2,
+      new Column[] { ds.col("value") },
+      new Column[] { ds2.col("value").desc() },
+      (CoGroupFunction<Integer, String, Integer, String>) (key, left, right) -> {
+        StringBuilder sb = new StringBuilder(key.toString());
+        while (left.hasNext()) {
+          sb.append(left.next());
+        }
+        sb.append("#");
+        while (right.hasNext()) {
+          sb.append(right.next());
+        }
+        return Collections.singletonList(sb.toString()).iterator();
+      },
+      Encoders.STRING());
+
+    Assert.assertEquals(asSet("1a#2", "3barfoo#76", "5#10"), toSet(cogroupSorted.collectAsList()));
   }
 
   @Test
@@ -502,6 +535,76 @@ public class JavaDatasetSuite implements Serializable {
     Assert.assertEquals(
       Arrays.asList(tuple2(2, 2), tuple2(3, 3)),
       joined.collectAsList());
+  }
+
+  private static final Comparator<Tuple2<String, Integer>> comparatorStringAndIntTuple =
+      new Comparator<Tuple2<String, Integer>>() {
+        @Override
+        public int compare(Tuple2<String, Integer> o1, Tuple2<String, Integer> o2) {
+          if (o1._1.compareTo(o2._1) != 0) {
+            return o1._1.compareTo(o2._1);
+          }
+          return o1._2.compareTo(o2._2);
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+          return super.equals(obj);
+        }
+      };
+
+  private void assertEqualsUnorderly(
+      List<Tuple2<String, Integer>> expected,
+      List<Tuple2<String, Integer>> actual) {
+    Assert.assertEquals(
+        expected.stream().sorted(comparatorStringAndIntTuple).collect(Collectors.toList()),
+        actual.stream().sorted(comparatorStringAndIntTuple).collect(Collectors.toList())
+    );
+  }
+
+  @Test
+  public void testDropDuplicates() {
+    List<Tuple2<String, Integer>> data = Arrays.asList(
+        new Tuple2<>("a", 1), new Tuple2<>("a", 2),
+        new Tuple2<>("b", 1), new Tuple2<>("a", 1)
+    );
+    Dataset<Tuple2<String, Integer>> ds = spark.createDataset(data,
+        Encoders.tuple(Encoders.STRING(), Encoders.INT()));
+
+    assertEqualsUnorderly(
+        Arrays.asList(tuple2("a", 1), tuple2("a", 2), tuple2("b", 1)),
+        ds.dropDuplicates().collectAsList()
+    );
+
+    assertEqualsUnorderly(
+        Arrays.asList(tuple2("a", 1), tuple2("b", 1)),
+        ds.dropDuplicates("_1").collectAsList()
+    );
+
+    assertEqualsUnorderly(
+        Arrays.asList(tuple2("a", 1), tuple2("b", 1)),
+        ds.dropDuplicates(new String[] { "_1" }).collectAsList()
+    );
+
+    assertEqualsUnorderly(
+        Arrays.asList(tuple2("a", 1), tuple2("a", 2)),
+        ds.dropDuplicates("_2").collectAsList()
+    );
+
+    assertEqualsUnorderly(
+        Arrays.asList(tuple2("a", 1), tuple2("a", 2)),
+        ds.dropDuplicates(new String[] { "_2" }).collectAsList()
+    );
+
+    assertEqualsUnorderly(
+        Arrays.asList(tuple2("a", 1), tuple2("a", 2), tuple2("b", 1)),
+        ds.dropDuplicates("_1", "_2").collectAsList()
+    );
+
+    assertEqualsUnorderly(
+        Arrays.asList(tuple2("a", 1), tuple2("a", 2), tuple2("b", 1)),
+        ds.dropDuplicates(new String[] { "_1", "_2" }).collectAsList()
+    );
   }
 
   @Test
@@ -707,14 +810,16 @@ public class JavaDatasetSuite implements Serializable {
    */
   private static class PrivateClassTest { }
 
-  @Test(expected = UnsupportedOperationException.class)
+  @Test
   public void testJavaEncoderErrorMessageForPrivateClass() {
-    Encoders.javaSerialization(PrivateClassTest.class);
+    Assert.assertThrows(UnsupportedOperationException.class,
+      () -> Encoders.javaSerialization(PrivateClassTest.class));
   }
 
-  @Test(expected = UnsupportedOperationException.class)
+  @Test
   public void testKryoEncoderErrorMessageForPrivateClass() {
-    Encoders.kryo(PrivateClassTest.class);
+    Assert.assertThrows(UnsupportedOperationException.class,
+      () -> Encoders.kryo(PrivateClassTest.class));
   }
 
   public static class SimpleJavaBean implements Serializable {
@@ -1678,6 +1783,23 @@ public class JavaDatasetSuite implements Serializable {
     Assert.assertEquals(1, df.collectAsList().size());
   }
 
+  public static class ReadOnlyPropertyBean implements Serializable {
+      public boolean isEmpty() {
+        return true;
+      }
+  }
+
+  @Test
+  public void testReadOnlyPropertyBean() {
+    ReadOnlyPropertyBean bean = new ReadOnlyPropertyBean();
+    List<ReadOnlyPropertyBean> data = Arrays.asList(bean);
+    Dataset<ReadOnlyPropertyBean> df = spark.createDataset(data,
+            Encoders.bean(ReadOnlyPropertyBean.class));
+    Assert.assertEquals(1, df.schema().length());
+    Assert.assertEquals(1, df.collectAsList().size());
+
+  }
+
   public class CircularReference1Bean implements Serializable {
     private CircularReference2Bean child;
 
@@ -1747,29 +1869,33 @@ public class JavaDatasetSuite implements Serializable {
     }
   }
 
-  @Test(expected = UnsupportedOperationException.class)
+  @Test
   public void testCircularReferenceBean1() {
     CircularReference1Bean bean = new CircularReference1Bean();
-    spark.createDataset(Arrays.asList(bean), Encoders.bean(CircularReference1Bean.class));
+    Assert.assertThrows(UnsupportedOperationException.class,
+      () -> spark.createDataset(Arrays.asList(bean), Encoders.bean(CircularReference1Bean.class)));
   }
 
-  @Test(expected = UnsupportedOperationException.class)
+  @Test
   public void testCircularReferenceBean2() {
     CircularReference3Bean bean = new CircularReference3Bean();
-    spark.createDataset(Arrays.asList(bean), Encoders.bean(CircularReference3Bean.class));
+    Assert.assertThrows(UnsupportedOperationException.class,
+      () -> spark.createDataset(Arrays.asList(bean), Encoders.bean(CircularReference3Bean.class)));
   }
 
-  @Test(expected = UnsupportedOperationException.class)
+  @Test
   public void testCircularReferenceBean3() {
     CircularReference4Bean bean = new CircularReference4Bean();
-    spark.createDataset(Arrays.asList(bean), Encoders.bean(CircularReference4Bean.class));
+    Assert.assertThrows(UnsupportedOperationException.class,
+      () -> spark.createDataset(Arrays.asList(bean), Encoders.bean(CircularReference4Bean.class)));
   }
 
-  @Test(expected = RuntimeException.class)
+  @Test
   public void testNullInTopLevelBean() {
     NestedSmallBean bean = new NestedSmallBean();
     // We cannot set null in top-level bean
-    spark.createDataset(Arrays.asList(bean, null), Encoders.bean(NestedSmallBean.class));
+    Assert.assertThrows(RuntimeException.class,
+      () -> spark.createDataset(Arrays.asList(bean, null), Encoders.bean(NestedSmallBean.class)));
   }
 
   @Test
@@ -1846,6 +1972,24 @@ public class JavaDatasetSuite implements Serializable {
     Dataset<SpecificListsBean> dataset =
       spark.createDataset(beans, Encoders.bean(SpecificListsBean.class));
     Assert.assertEquals(beans, dataset.collectAsList());
+  }
+
+  @Test
+  public void testRowEncoder() {
+    final StructType schema = new StructType()
+        .add("a", "int")
+        .add("b", "string");
+    final Dataset<Row> df = spark.range(3)
+        .map(new MapFunction<Long, Row>() {
+               @Override
+               public Row call(Long i) {
+                 return create(i.intValue(), "s" + i);
+               }
+             },
+            Encoders.row(schema))
+        .filter(col("a").geq(1));
+    final List<Row> expected = Arrays.asList(create(1, "s1"), create(2, "s2"));
+    Assert.assertEquals(expected, df.collectAsList());
   }
 
   public static class SpecificListsBean implements Serializable {

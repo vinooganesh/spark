@@ -128,8 +128,10 @@ object ShufflePartitionsUtil extends Logging {
 
     // There should be no unexpected partition specs and the start indices should be identical
     // across all different shuffles.
-    assert(partitionIndicesSeq.distinct.length == 1 && partitionIndicesSeq.head.forall(_ >= 0),
-      s"Invalid shuffle partition specs: $inputPartitionSpecs")
+    if (partitionIndicesSeq.distinct.length > 1 || partitionIndicesSeq.head.exists(_ < 0)) {
+      logWarning(s"Could not apply partition coalescing because of unexpected partition indices.")
+      return Seq.empty
+    }
 
     // The indices may look like [0, 1, 2, 2, 2, 3, 4, 4, 5], and the repeated `2` and `4` mean
     // skewed partitions.
@@ -305,9 +307,9 @@ object ShufflePartitionsUtil extends Logging {
           val dataSize = spec.startReducerIndex.until(spec.endReducerIndex)
             .map(mapStats.bytesByPartitionId).sum
           spec.copy(dataSize = Some(dataSize))
-        }.toSeq
-      case None => partitionSpecs.map(_.copy(dataSize = Some(0))).toSeq
-    }.toSeq
+        }
+      case None => partitionSpecs.map(_.copy(dataSize = Some(0)))
+    }
   }
 
   /**
@@ -317,7 +319,7 @@ object ShufflePartitionsUtil extends Logging {
    */
   // Visible for testing
   private[sql] def splitSizeListByTargetSize(
-      sizes: Seq[Long],
+      sizes: Array[Long],
       targetSize: Long,
       smallPartitionFactor: Double): Array[Int] = {
     val partitionStartIndices = ArrayBuffer[Int]()
@@ -394,7 +396,12 @@ object ShufflePartitionsUtil extends Logging {
         } else {
           mapStartIndices(i + 1)
         }
-        val dataSize = startMapIndex.until(endMapIndex).map(mapPartitionSizes(_)).sum
+        var dataSize = 0L
+        var mapIndex = startMapIndex
+        while (mapIndex < endMapIndex) {
+          dataSize += mapPartitionSizes(mapIndex)
+          mapIndex += 1
+        }
         PartialReducerPartitionSpec(reducerId, startMapIndex, endMapIndex, dataSize)
       })
     } else {

@@ -35,7 +35,7 @@
     spark.createDataFrame(data, schema)
     spark.createDataFrame(data, "name string, age integer")
     spark.createDataFrame([(1, ("foo", "bar"))], ("_1", "_2"))
-    spark.createDataFrame(data, ("name", "age"), samplingRatio=0.1)  # type: ignore
+    spark.createDataFrame(data, ("name", "age"), samplingRatio=0.1)
 
 
 - case: createDataFrameScalarsValid
@@ -97,7 +97,12 @@
     main:18: note: Possible overload variants:
     main:18: note:     def [RowLike in (List[Any], Tuple[Any, ...], Row)] createDataFrame(self, data: Iterable[RowLike], schema: Union[List[str], Tuple[str, ...]] = ..., samplingRatio: Optional[float] = ...) -> DataFrame
     main:18: note:     def [RowLike in (List[Any], Tuple[Any, ...], Row)] createDataFrame(self, data: RDD[RowLike], schema: Union[List[str], Tuple[str, ...]] = ..., samplingRatio: Optional[float] = ...) -> DataFrame
-    main:18: note:     <6 more non-matching overloads not shown>
+    main:18: note:     def [RowLike in (List[Any], Tuple[Any, ...], Row)] createDataFrame(self, data: Iterable[RowLike], schema: Union[StructType, str], *, verifySchema: bool = ...) -> DataFrame
+    main:18: note:     def [RowLike in (List[Any], Tuple[Any, ...], Row)] createDataFrame(self, data: RDD[RowLike], schema: Union[StructType, str], *, verifySchema: bool = ...) -> DataFrame
+    main:18: note:     def [AtomicValue in (datetime, date, Decimal, bool, str, int, float)] createDataFrame(self, data: RDD[AtomicValue], schema: Union[AtomicType, str], verifySchema: bool = ...) -> DataFrame
+    main:18: note:     def [AtomicValue in (datetime, date, Decimal, bool, str, int, float)] createDataFrame(self, data: Iterable[AtomicValue], schema: Union[AtomicType, str], verifySchema: bool = ...) -> DataFrame
+    main:18: note:     def createDataFrame(self, data: DataFrame, samplingRatio: Optional[float] = ...) -> DataFrame
+    main:18: note:     def createDataFrame(self, data: DataFrame, schema: Union[StructType, str], verifySchema: bool = ...) -> DataFrame
 
 
 - case: createDataFrameFromEmptyRdd

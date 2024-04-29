@@ -21,7 +21,7 @@ import scala.collection.mutable
 import scala.language.implicitConversions
 
 import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.encoders.RowEncoder
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.execution.SerializeFromObjectExec
 import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.functions._
@@ -49,7 +49,7 @@ class ForeachBatchSinkSuite extends StreamTest {
     val mem = MemoryStream[Int]
     val ds = mem.toDF.selectExpr("value + 1 as value")
 
-    val tester = new ForeachBatchTester[Row](mem)(RowEncoder.apply(ds.schema))
+    val tester = new ForeachBatchTester[Row](mem)(ExpressionEncoder(ds.schema))
     val writer = (df: DataFrame, batchId: Long) =>
       tester.record(batchId, df.selectExpr("value + 1"))
 
@@ -160,15 +160,15 @@ class ForeachBatchSinkSuite extends StreamTest {
       var planAsserted = false
 
       val writer: (Dataset[T], Long) => Unit = { case (df, _) =>
-        assert(df.queryExecution.executedPlan.find { p =>
+        assert(!df.queryExecution.executedPlan.exists { p =>
           p.isInstanceOf[SerializeFromObjectExec]
-        }.isEmpty, "Untyped Dataset should not introduce serialization on object!")
+        }, "Untyped Dataset should not introduce serialization on object!")
         planAsserted = true
       }
 
       stream.addData(1, 2, 3, 4, 5)
 
-      val query = ds.writeStream.trigger(Trigger.Once()).foreachBatch(writer).start()
+      val query = ds.writeStream.trigger(Trigger.AvailableNow()).foreachBatch(writer).start()
       query.awaitTermination()
 
       assert(planAsserted, "ForeachBatch writer should be called!")

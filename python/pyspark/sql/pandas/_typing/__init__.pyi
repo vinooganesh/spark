@@ -30,11 +30,14 @@ from typing_extensions import Protocol, Literal
 from types import FunctionType
 
 from pyspark.sql._typing import LiteralType
+from pyspark.sql.streaming.state import GroupState
 from pandas.core.frame import DataFrame as PandasDataFrame
 from pandas.core.series import Series as PandasSeries
+from numpy import ndarray as NDArray
 
-import pyarrow  # type: ignore[import]
+import pyarrow
 
+ArrayLike = NDArray
 DataFrameLike = PandasDataFrame
 SeriesLike = PandasSeries
 DataFrameOrSeriesLike = Union[DataFrameLike, SeriesLike]
@@ -42,12 +45,14 @@ DataFrameOrSeriesLike_ = TypeVar("DataFrameOrSeriesLike_", bound=DataFrameOrSeri
 
 # UDF annotations
 PandasScalarUDFType = Literal[200]
-PandasScalarIterUDFType = Literal[204]
 PandasGroupedMapUDFType = Literal[201]
-PandasCogroupedMapUDFType = Literal[206]
 PandasGroupedAggUDFType = Literal[202]
+PandasWindowAggUDFType = Literal[203]
+PandasScalarIterUDFType = Literal[204]
 PandasMapIterUDFType = Literal[205]
+PandasCogroupedMapUDFType = Literal[206]
 ArrowMapIterUDFType = Literal[207]
+PandasGroupedMapUDFWithStateType = Literal[208]
 
 class PandasVariadicScalarToScalarFunction(Protocol):
     def __call__(self, *_: DataFrameOrSeriesLike_) -> DataFrameOrSeriesLike_: ...
@@ -253,6 +258,10 @@ PandasGroupedMapFunction = Union[
     Callable[[Any, DataFrameLike], DataFrameLike],
 ]
 
+PandasGroupedMapFunctionWithState = Callable[
+    [Any, Iterable[DataFrameLike], GroupState], Iterable[DataFrameLike]
+]
+
 class PandasVariadicGroupedAggFunction(Protocol):
     def __call__(self, *_: SeriesLike) -> LiteralType: ...
 
@@ -327,6 +336,9 @@ PandasMapIterFunction = Callable[[Iterable[DataFrameLike]], Iterable[DataFrameLi
 
 ArrowMapIterFunction = Callable[[Iterable[pyarrow.RecordBatch]], Iterable[pyarrow.RecordBatch]]
 
-PandasCogroupedMapFunction = Callable[[DataFrameLike, DataFrameLike], DataFrameLike]
+PandasCogroupedMapFunction = Union[
+    Callable[[DataFrameLike, DataFrameLike], DataFrameLike],
+    Callable[[Any, DataFrameLike, DataFrameLike], DataFrameLike],
+]
 
 GroupedMapPandasUserDefinedFunction = NewType("GroupedMapPandasUserDefinedFunction", FunctionType)

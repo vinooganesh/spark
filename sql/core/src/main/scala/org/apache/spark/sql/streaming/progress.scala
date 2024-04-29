@@ -24,7 +24,9 @@ import java.util.UUID
 import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 
+import com.fasterxml.jackson.databind.{DeserializationFeature, ObjectMapper}
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
+import com.fasterxml.jackson.module.scala.{ClassTagExtensions, DefaultScalaModule}
 import org.json4s._
 import org.json4s.JsonAST.JValue
 import org.json4s.JsonDSL._
@@ -40,7 +42,7 @@ import org.apache.spark.sql.streaming.SinkProgress.DEFAULT_NUM_OUTPUT_ROWS
  * Information about updates made to stateful operators in a [[StreamingQuery]] during a trigger.
  */
 @Evolving
-class StateOperatorProgress private[sql](
+class StateOperatorProgress private[spark](
     val operatorName: String,
     val numRowsTotal: Long,
     val numRowsUpdated: Long,
@@ -125,7 +127,7 @@ class StateOperatorProgress private[sql](
  * @since 2.1.0
  */
 @Evolving
-class StreamingQueryProgress private[sql](
+class StreamingQueryProgress private[spark](
   val id: UUID,
   val runId: UUID,
   val name: String,
@@ -175,6 +177,21 @@ class StreamingQueryProgress private[sql](
   }
 }
 
+private[spark] object StreamingQueryProgress {
+  private[this] val mapper = {
+    val ret = new ObjectMapper() with ClassTagExtensions
+    ret.registerModule(DefaultScalaModule)
+    ret.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+    ret
+  }
+
+  private[spark] def jsonString(progress: StreamingQueryProgress): String =
+    mapper.writeValueAsString(progress)
+
+  private[spark] def fromJson(json: String): StreamingQueryProgress =
+    mapper.readValue[StreamingQueryProgress](json)
+}
+
 /**
  * Information about progress made for a source in the execution of a [[StreamingQuery]]
  * during a trigger. See [[StreamingQueryProgress]] for more information.
@@ -190,7 +207,7 @@ class StreamingQueryProgress private[sql](
  * @since 2.1.0
  */
 @Evolving
-class SourceProgress protected[sql](
+class SourceProgress protected[spark](
   val description: String,
   val startOffset: String,
   val endOffset: String,
@@ -236,9 +253,10 @@ class SourceProgress protected[sql](
  * @since 2.1.0
  */
 @Evolving
-class SinkProgress protected[sql](
+class SinkProgress protected[spark](
     val description: String,
-    val numOutputRows: Long) extends Serializable {
+    val numOutputRows: Long,
+    val metrics: ju.Map[String, String] = Map[String, String]().asJava) extends Serializable {
 
   /** SinkProgress without custom metrics. */
   protected[sql] def this(description: String) = {
@@ -255,15 +273,17 @@ class SinkProgress protected[sql](
 
   private[sql] def jsonValue: JValue = {
     ("description" -> JString(description)) ~
-      ("numOutputRows" -> JInt(numOutputRows))
+      ("numOutputRows" -> JInt(numOutputRows)) ~
+      ("metrics" -> safeMapToJValue[String](metrics, s => JString(s)))
   }
 }
 
 private[sql] object SinkProgress {
   val DEFAULT_NUM_OUTPUT_ROWS: Long = -1L
 
-  def apply(description: String, numOutputRows: Option[Long]): SinkProgress =
-    new SinkProgress(description, numOutputRows.getOrElse(DEFAULT_NUM_OUTPUT_ROWS))
+  def apply(description: String, numOutputRows: Option[Long],
+            metrics: ju.Map[String, String] = Map[String, String]().asJava): SinkProgress =
+    new SinkProgress(description, numOutputRows.getOrElse(DEFAULT_NUM_OUTPUT_ROWS), metrics)
 }
 
 private object SafeJsonSerializer {

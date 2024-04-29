@@ -103,15 +103,15 @@ public class TransportConf {
       conf.get("spark.network.timeout", "120s"));
     long defaultTimeoutMs = JavaUtils.timeStringAsSec(
       conf.get(SPARK_NETWORK_IO_CONNECTIONTIMEOUT_KEY, defaultNetworkTimeoutS + "s")) * 1000;
-    return (int) defaultTimeoutMs;
+    return defaultTimeoutMs < 0 ? 0 : (int) defaultTimeoutMs;
   }
 
-  /** Connect creation timeout in milliseconds. Default 30 secs. */
+  /** Connect creation timeout in milliseconds. Default 120 secs. */
   public int connectionCreationTimeoutMs() {
     long connectionTimeoutS = TimeUnit.MILLISECONDS.toSeconds(connectionTimeoutMs());
     long defaultTimeoutMs = JavaUtils.timeStringAsSec(
       conf.get(SPARK_NETWORK_IO_CONNECTIONCREATIONTIMEOUT_KEY,  connectionTimeoutS + "s")) * 1000;
-    return (int) defaultTimeoutMs;
+    return defaultTimeoutMs < 0 ? 0 : (int) defaultTimeoutMs;
   }
 
   /** Number of concurrent connections between two nodes for fetching data. */
@@ -213,51 +213,19 @@ public class TransportConf {
   }
 
   /**
+   * Version number to be used by the AuthEngine key agreement protocol. Valid values are 1 or 2.
+   * The default version is 1 for backward compatibility. Version 2 is recommended for stronger
+   * security properties.
+   */
+  public int authEngineVersion() {
+    return conf.getInt("spark.network.crypto.authEngineVersion", 1);
+  }
+
+  /**
    * The cipher transformation to use for encrypting session data.
    */
   public String cipherTransformation() {
     return conf.get("spark.network.crypto.cipher", "AES/CTR/NoPadding");
-  }
-
-  /**
-   * The key generation algorithm. This should be an algorithm that accepts a "PBEKeySpec"
-   * as input. The default value (PBKDF2WithHmacSHA1) is available in Java 7.
-   */
-  public String keyFactoryAlgorithm() {
-    return conf.get("spark.network.crypto.keyFactoryAlgorithm", "PBKDF2WithHmacSHA1");
-  }
-
-  /**
-   * How many iterations to run when generating keys.
-   *
-   * See some discussion about this at: http://security.stackexchange.com/q/3959
-   * The default value was picked for speed, since it assumes that the secret has good entropy
-   * (128 bits by default), which is not generally the case with user passwords.
-   */
-  public int keyFactoryIterations() {
-    return conf.getInt("spark.network.crypto.keyFactoryIterations", 1024);
-  }
-
-  /**
-   * Encryption key length, in bits.
-   */
-  public int encryptionKeyLength() {
-    return conf.getInt("spark.network.crypto.keyLength", 128);
-  }
-
-  /**
-   * Initial vector length, in bytes.
-   */
-  public int ivLength() {
-    return conf.getInt("spark.network.crypto.ivLength", 16);
-  }
-
-  /**
-   * The algorithm for generated secret keys. Nobody should really need to change this,
-   * but configurable just in case.
-   */
-  public String keyAlgorithm() {
-    return conf.get("spark.network.crypto.keyAlgorithm", "AES");
   }
 
   /**
@@ -374,6 +342,13 @@ public class TransportConf {
     return conf.getBoolean("spark.shuffle.useOldFetchProtocol", false);
   }
 
+  /** Whether to enable sasl retries or not. The number of retries is dictated by the config
+   * `spark.shuffle.io.maxRetries`.
+   */
+  public boolean enableSaslRetries() {
+    return conf.getBoolean("spark.shuffle.sasl.enableRetries", false);
+  }
+
   /**
    * Class name of the implementation of MergedShuffleFileManager that merges the blocks
    * pushed to it when push-based shuffle is enabled. By default, push-based shuffle is disabled at
@@ -426,5 +401,14 @@ public class TransportConf {
    */
   public int ioExceptionsThresholdDuringMerge() {
     return conf.getInt("spark.shuffle.push.server.ioExceptionsThresholdDuringMerge", 4);
+  }
+
+  /**
+   * The RemoteBlockPushResolver#mergedShuffleCleanermergedShuffleCleaner
+   * shutdown timeout, in seconds.
+   */
+  public long mergedShuffleCleanerShutdownTimeout() {
+    return JavaUtils.timeStringAsSec(
+      conf.get("spark.shuffle.push.server.mergedShuffleCleaner.shutdown.timeout", "60s"));
   }
 }

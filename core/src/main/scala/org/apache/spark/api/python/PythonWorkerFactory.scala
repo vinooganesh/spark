@@ -17,7 +17,7 @@
 
 package org.apache.spark.api.python
 
-import java.io.{DataInputStream, DataOutputStream, EOFException, InputStream}
+import java.io.{DataInputStream, DataOutputStream, EOFException, File, InputStream}
 import java.net.{InetAddress, ServerSocket, Socket, SocketException}
 import java.util.Arrays
 import java.util.concurrent.TimeUnit
@@ -77,7 +77,7 @@ private[spark] class PythonWorkerFactory(pythonExec: String, envVars: Map[String
 
   @GuardedBy("self")
   private var daemon: Process = null
-  val daemonHost = InetAddress.getByAddress(Array(127, 0, 0, 1))
+  val daemonHost = InetAddress.getLoopbackAddress()
   @GuardedBy("self")
   private var daemonPort: Int = 0
   @GuardedBy("self")
@@ -106,8 +106,13 @@ private[spark] class PythonWorkerFactory(pythonExec: String, envVars: Map[String
       }
       createThroughDaemon()
     } else {
-      createSimpleWorker()
+      createSimpleWorker(workerModule)
     }
+  }
+
+  /** Creates a Python worker with streaming worker module. */
+  def createStreamingWorker(streamingWorkerModule: String): (Socket, Option[Int]) = {
+    createSimpleWorker(streamingWorkerModule)
   }
 
   /**
@@ -150,13 +155,19 @@ private[spark] class PythonWorkerFactory(pythonExec: String, envVars: Map[String
   /**
    * Launch a worker by executing worker.py (by default) directly and telling it to connect to us.
    */
-  private def createSimpleWorker(): (Socket, Option[Int]) = {
+  private def createSimpleWorker(workerModule: String): (Socket, Option[Int]) = {
     var serverSocket: ServerSocket = null
     try {
-      serverSocket = new ServerSocket(0, 1, InetAddress.getByAddress(Array(127, 0, 0, 1)))
+      serverSocket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())
 
       // Create and start the worker
       val pb = new ProcessBuilder(Arrays.asList(pythonExec, "-m", workerModule))
+      val jobArtifactUUID = envVars.getOrElse("SPARK_JOB_ARTIFACT_UUID", "default")
+      if (jobArtifactUUID != "default") {
+        val f = new File(SparkFiles.getRootDirectory(), jobArtifactUUID)
+        f.mkdir()
+        pb.directory(f)
+      }
       val workerEnv = pb.environment()
       workerEnv.putAll(envVars.asJava)
       workerEnv.put("PYTHONPATH", pythonPath)
@@ -164,6 +175,9 @@ private[spark] class PythonWorkerFactory(pythonExec: String, envVars: Map[String
       workerEnv.put("PYTHONUNBUFFERED", "YES")
       workerEnv.put("PYTHON_WORKER_FACTORY_PORT", serverSocket.getLocalPort.toString)
       workerEnv.put("PYTHON_WORKER_FACTORY_SECRET", authHelper.secret)
+      if (Utils.preferIPv6) {
+        workerEnv.put("SPARK_PREFER_IPV6", "True")
+      }
       val worker = pb.start()
 
       // Redirect worker stdout and stderr
@@ -207,10 +221,19 @@ private[spark] class PythonWorkerFactory(pythonExec: String, envVars: Map[String
         // Create and start the daemon
         val command = Arrays.asList(pythonExec, "-m", daemonModule)
         val pb = new ProcessBuilder(command)
+        val jobArtifactUUID = envVars.getOrElse("SPARK_JOB_ARTIFACT_UUID", "default")
+        if (jobArtifactUUID != "default") {
+          val f = new File(SparkFiles.getRootDirectory(), jobArtifactUUID)
+          f.mkdir()
+          pb.directory(f)
+        }
         val workerEnv = pb.environment()
         workerEnv.putAll(envVars.asJava)
         workerEnv.put("PYTHONPATH", pythonPath)
         workerEnv.put("PYTHON_WORKER_FACTORY_SECRET", authHelper.secret)
+        if (Utils.preferIPv6) {
+          workerEnv.put("SPARK_PREFER_IPV6", "True")
+        }
         // This is equivalent to setting the -u flag; we use it because ipython doesn't support -u:
         workerEnv.put("PYTHONUNBUFFERED", "YES")
         daemon = pb.start()

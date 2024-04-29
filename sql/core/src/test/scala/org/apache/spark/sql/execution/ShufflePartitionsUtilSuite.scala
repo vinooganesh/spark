@@ -567,14 +567,13 @@ class ShufflePartitionsUtilSuite extends SparkFunSuite with LocalSparkContext {
     }
 
     {
-      // Assertion error if shuffle partition specs contain `CoalescedShuffleSpec` that has
-      // `end` - `start` > 1.
+      // If shuffle partition specs contain `CoalescedShuffleSpec` that has
+      // `end` - `start` > 1, return empty result.
       val bytesByPartitionId1 = Array[Long](10, 10, 10, 10, 10)
       val bytesByPartitionId2 = Array[Long](10, 10, 10, 10, 10)
       val specs1 = Seq(CoalescedPartitionSpec(0, 1), CoalescedPartitionSpec(1, 5))
       val specs2 = specs1
-      intercept[AssertionError] {
-        ShufflePartitionsUtil.coalescePartitions(
+      val coalesced = ShufflePartitionsUtil.coalescePartitions(
           Array(
             Some(new MapOutputStatistics(0, bytesByPartitionId1)),
             Some(new MapOutputStatistics(1, bytesByPartitionId2))),
@@ -582,17 +581,16 @@ class ShufflePartitionsUtilSuite extends SparkFunSuite with LocalSparkContext {
             Some(specs1),
             Some(specs2)),
           targetSize, 1, 0)
-      }
+      assert(coalesced.isEmpty)
     }
 
     {
-      // Assertion error if shuffle partition specs contain `PartialMapperShuffleSpec`.
+      // If shuffle partition specs contain `PartialMapperShuffleSpec`, return empty result.
       val bytesByPartitionId1 = Array[Long](10, 10, 10, 10, 10)
       val bytesByPartitionId2 = Array[Long](10, 10, 10, 10, 10)
       val specs1 = Seq(CoalescedPartitionSpec(0, 1), PartialMapperPartitionSpec(1, 0, 1))
       val specs2 = specs1
-      intercept[AssertionError] {
-        ShufflePartitionsUtil.coalescePartitions(
+      val coalesced = ShufflePartitionsUtil.coalescePartitions(
           Array(
             Some(new MapOutputStatistics(0, bytesByPartitionId1)),
             Some(new MapOutputStatistics(1, bytesByPartitionId2))),
@@ -600,18 +598,17 @@ class ShufflePartitionsUtilSuite extends SparkFunSuite with LocalSparkContext {
             Some(specs1),
             Some(specs2)),
           targetSize, 1, 0)
-      }
+      assert(coalesced.isEmpty)
     }
 
     {
-      // Assertion error if partition specs of different shuffles have different lengths.
+      // If partition specs of different shuffles have different lengths, return empty result.
       val bytesByPartitionId1 = Array[Long](10, 10, 10, 10, 10)
       val bytesByPartitionId2 = Array[Long](10, 10, 10, 10, 10)
       val specs1 = Seq.tabulate(4)(i => CoalescedPartitionSpec(i, i + 1)) ++
         Seq.tabulate(2)(i => PartialReducerPartitionSpec(4, i, i + 1, 10L))
       val specs2 = Seq.tabulate(5)(i => CoalescedPartitionSpec(i, i + 1))
-      intercept[AssertionError] {
-        ShufflePartitionsUtil.coalescePartitions(
+      val coalesced = ShufflePartitionsUtil.coalescePartitions(
           Array(
             Some(new MapOutputStatistics(0, bytesByPartitionId1)),
             Some(new MapOutputStatistics(1, bytesByPartitionId2))),
@@ -619,11 +616,12 @@ class ShufflePartitionsUtilSuite extends SparkFunSuite with LocalSparkContext {
             Some(specs1),
             Some(specs2)),
           targetSize, 1, 0)
-      }
+      assert(coalesced.isEmpty)
     }
 
     {
-      // Assertion error if start indices of partition specs are not identical among all shuffles.
+      // If start indices of partition specs are not identical among all shuffles,
+      // return empty result.
       val bytesByPartitionId1 = Array[Long](10, 10, 10, 10, 10)
       val bytesByPartitionId2 = Array[Long](10, 10, 10, 10, 10)
       val specs1 = Seq.tabulate(4)(i => CoalescedPartitionSpec(i, i + 1)) ++
@@ -631,8 +629,7 @@ class ShufflePartitionsUtilSuite extends SparkFunSuite with LocalSparkContext {
       val specs2 = Seq.tabulate(2)(i => CoalescedPartitionSpec(i, i + 1)) ++
         Seq.tabulate(2)(i => PartialReducerPartitionSpec(2, i, i + 1, 10L)) ++
         Seq.tabulate(2)(i => CoalescedPartitionSpec(i + 3, i + 4))
-      intercept[AssertionError] {
-        ShufflePartitionsUtil.coalescePartitions(
+      val coalesced = ShufflePartitionsUtil.coalescePartitions(
           Array(
             Some(new MapOutputStatistics(0, bytesByPartitionId1)),
             Some(new MapOutputStatistics(1, bytesByPartitionId2))),
@@ -640,7 +637,7 @@ class ShufflePartitionsUtilSuite extends SparkFunSuite with LocalSparkContext {
             Some(specs1),
             Some(specs2)),
           targetSize, 1, 0)
-      }
+      assert(coalesced.isEmpty)
     }
 
     {
@@ -705,50 +702,50 @@ class ShufflePartitionsUtilSuite extends SparkFunSuite with LocalSparkContext {
 
     val smallPartitionFactor1 = ShufflePartitionsUtil.SMALL_PARTITION_FACTOR
     // merge the small partitions at the beginning/end
-    val sizeList1 = Seq[Long](15, 90, 15, 15, 15, 90, 15)
+    val sizeList1 = Array[Long](15, 90, 15, 15, 15, 90, 15)
     assert(ShufflePartitionsUtil.splitSizeListByTargetSize(
       sizeList1, targetSize, smallPartitionFactor1).toSeq ==
       Seq(0, 2, 5))
 
     // merge the small partitions in the middle
-    val sizeList2 = Seq[Long](30, 15, 90, 10, 90, 15, 30)
+    val sizeList2 = Array[Long](30, 15, 90, 10, 90, 15, 30)
     assert(ShufflePartitionsUtil.splitSizeListByTargetSize(
       sizeList2, targetSize, smallPartitionFactor1).toSeq ==
       Seq(0, 2, 4, 5))
 
     // merge small partitions if the partition itself is smaller than
     // targetSize * SMALL_PARTITION_FACTOR
-    val sizeList3 = Seq[Long](15, 1000, 15, 1000)
+    val sizeList3 = Array[Long](15, 1000, 15, 1000)
     assert(ShufflePartitionsUtil.splitSizeListByTargetSize(
       sizeList3, targetSize, smallPartitionFactor1).toSeq ==
       Seq(0, 3))
 
     // merge small partitions if the combined size is smaller than
     // targetSize * MERGED_PARTITION_FACTOR
-    val sizeList4 = Seq[Long](35, 75, 90, 20, 35, 25, 35)
+    val sizeList4 = Array[Long](35, 75, 90, 20, 35, 25, 35)
     assert(ShufflePartitionsUtil.splitSizeListByTargetSize(
       sizeList4, targetSize, smallPartitionFactor1).toSeq ==
       Seq(0, 2, 3))
 
     val smallPartitionFactor2 = 0.5
     // merge last two partition if their size is not bigger than smallPartitionFactor * target
-    val sizeList5 = Seq[Long](50, 50, 40, 5)
+    val sizeList5 = Array[Long](50, 50, 40, 5)
     assert(ShufflePartitionsUtil.splitSizeListByTargetSize(
       sizeList5, targetSize, smallPartitionFactor2).toSeq ==
       Seq(0))
 
-    val sizeList6 = Seq[Long](40, 5, 50, 45)
+    val sizeList6 = Array[Long](40, 5, 50, 45)
     assert(ShufflePartitionsUtil.splitSizeListByTargetSize(
       sizeList6, targetSize, smallPartitionFactor2).toSeq ==
       Seq(0))
 
     // do not merge
-    val sizeList7 = Seq[Long](50, 50, 10, 40, 5)
+    val sizeList7 = Array[Long](50, 50, 10, 40, 5)
     assert(ShufflePartitionsUtil.splitSizeListByTargetSize(
       sizeList7, targetSize, smallPartitionFactor2).toSeq ==
       Seq(0, 2))
 
-    val sizeList8 = Seq[Long](10, 40, 5, 50, 50)
+    val sizeList8 = Array[Long](10, 40, 5, 50, 50)
     assert(ShufflePartitionsUtil.splitSizeListByTargetSize(
       sizeList8, targetSize, smallPartitionFactor2).toSeq ==
       Seq(0, 3))

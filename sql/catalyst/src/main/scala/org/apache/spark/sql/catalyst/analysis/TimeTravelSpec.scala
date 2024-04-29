@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
-import org.apache.spark.sql.catalyst.expressions.{AnsiCast, Cast, Expression, RuntimeReplaceable, SubqueryExpression, Unevaluable}
+import org.apache.spark.sql.catalyst.expressions.{Cast, Expression, RuntimeReplaceable, SubqueryExpression, Unevaluable}
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.TimestampType
@@ -37,22 +37,26 @@ object TimeTravelSpec {
     } else if (timestamp.nonEmpty) {
       val ts = timestamp.get
       assert(ts.resolved && ts.references.isEmpty && !SubqueryExpression.hasSubquery(ts))
-      if (!AnsiCast.canCast(ts.dataType, TimestampType)) {
-        throw QueryCompilationErrors.invalidTimestampExprForTimeTravel(ts)
+      if (!Cast.canAnsiCast(ts.dataType, TimestampType)) {
+        throw QueryCompilationErrors.invalidTimestampExprForTimeTravel(
+          "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.INPUT", ts)
       }
       val tsToEval = ts.transform {
-        case r: RuntimeReplaceable => r.child
+        case r: RuntimeReplaceable => r.replacement
         case _: Unevaluable =>
-          throw QueryCompilationErrors.invalidTimestampExprForTimeTravel(ts)
+          throw QueryCompilationErrors.invalidTimestampExprForTimeTravel(
+            "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.UNEVALUABLE", ts)
         case e if !e.deterministic =>
-          throw QueryCompilationErrors.invalidTimestampExprForTimeTravel(ts)
+          throw QueryCompilationErrors.invalidTimestampExprForTimeTravel(
+            "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.NON_DETERMINISTIC", ts)
       }
       val tz = Some(conf.sessionLocalTimeZone)
       // Set `ansiEnabled` to false, so that it can return null for invalid input and we can provide
       // better error message.
       val value = Cast(tsToEval, TimestampType, tz, ansiEnabled = false).eval()
       if (value == null) {
-        throw QueryCompilationErrors.invalidTimestampExprForTimeTravel(ts)
+        throw QueryCompilationErrors.invalidTimestampExprForTimeTravel(
+          "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.INPUT", ts)
       }
       Some(AsOfTimestamp(value.asInstanceOf[Long]))
     } else if (version.nonEmpty) {

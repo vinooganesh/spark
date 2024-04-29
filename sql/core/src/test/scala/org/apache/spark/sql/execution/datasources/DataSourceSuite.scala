@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.execution.datasources
 
+import java.net.URI
+
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path, RawLocalFileSystem}
 import org.scalatest.PrivateMethodTester
@@ -109,18 +111,22 @@ class DataSourceSuite extends SharedSparkSession with PrivateMethodTester {
   }
 
   test("test non existent paths") {
-    assertThrows[AnalysisException](
-      DataSource.checkAndGlobPathIfNecessary(
-        Seq(
-          path1.toString,
-          path2.toString,
-          nonExistentPath.toString
-        ),
-        hadoopConf,
-        checkEmptyGlobPath = true,
-        checkFilesExist = true,
-        enableGlobbing = true
-      )
+    checkError(
+      exception = intercept[AnalysisException](
+        DataSource.checkAndGlobPathIfNecessary(
+          Seq(
+            path1.toString,
+            path2.toString,
+            nonExistentPath.toString
+          ),
+          hadoopConf,
+          checkEmptyGlobPath = true,
+          checkFilesExist = true,
+          enableGlobbing = true
+        )
+      ),
+      errorClass = "PATH_NOT_FOUND",
+      parameters = Map("path" -> nonExistentPath.toString)
     )
   }
 
@@ -143,7 +149,8 @@ class DataSourceSuite extends SharedSparkSession with PrivateMethodTester {
   test("Data source options should be propagated in method checkAndGlobPathIfNecessary") {
     val dataSourceOptions = Map("fs.defaultFS" -> "nonexistentFs://nonexistentFs")
     val dataSource = DataSource(spark, "parquet", Seq("/path3"), options = dataSourceOptions)
-    val checkAndGlobPathIfNecessary = PrivateMethod[Seq[Path]]('checkAndGlobPathIfNecessary)
+    val checkAndGlobPathIfNecessary =
+      PrivateMethod[Seq[Path]](Symbol("checkAndGlobPathIfNecessary"))
 
     val message = intercept[java.io.IOException] {
       dataSource invokePrivate checkAndGlobPathIfNecessary(false, false)
@@ -209,4 +216,6 @@ class MockFileSystem extends RawLocalFileSystem {
   override def globStatus(pathPattern: Path): Array[FileStatus] = {
     mockGlobResults.getOrElse(pathPattern, Array())
   }
+
+  override def getUri: URI = URI.create("mockFs://mockFs/")
 }

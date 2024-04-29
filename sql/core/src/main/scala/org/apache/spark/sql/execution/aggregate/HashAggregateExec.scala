@@ -30,13 +30,16 @@ import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
+import org.apache.spark.sql.catalyst.plans.logical.Aggregate
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
 import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.vectorized.MutableColumnarRow
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{CalendarIntervalType, DecimalType, StringType, StructType}
+import org.apache.spark.sql.types.{CalendarIntervalType, DecimalType, StringType}
 import org.apache.spark.unsafe.KVIterator
 import org.apache.spark.util.Utils
 
@@ -45,6 +48,8 @@ import org.apache.spark.util.Utils
  */
 case class HashAggregateExec(
     requiredChildDistributionExpressions: Option[Seq[Expression]],
+    isStreaming: Boolean,
+    numShufflePartitions: Option[Int],
     groupingExpressions: Seq[NamedExpression],
     aggregateExpressions: Seq[AggregateExpression],
     aggregateAttributes: Seq[Attribute],
@@ -53,7 +58,7 @@ case class HashAggregateExec(
     child: SparkPlan)
   extends AggregateCodegenSupport {
 
-  require(HashAggregateExec.supportsAggregate(aggregateBufferAttributes))
+  require(Aggregate.supportsHashAggregate(aggregateBufferAttributes))
 
   override lazy val allAttributes: AttributeSeq =
     child.output ++ aggregateBufferAttributes ++ aggregateAttributes ++
@@ -65,7 +70,7 @@ case class HashAggregateExec(
     "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size"),
     "aggTime" -> SQLMetrics.createTimingMetric(sparkContext, "time in aggregation build"),
     "avgHashProbe" ->
-      SQLMetrics.createAverageMetric(sparkContext, "avg hash probe bucket list iters"),
+      SQLMetrics.createAverageMetric(sparkContext, "avg hash probes per key"),
     "numTasksFallBacked" -> SQLMetrics.createMetric(sparkContext, "number of sort fallback tasks"))
 
   // This is for testing. We force TungstenAggregationIterator to fall back to the unsafe row hash
@@ -129,11 +134,11 @@ case class HashAggregateExec(
   }
 
   private val groupingAttributes = groupingExpressions.map(_.toAttribute)
-  private val groupingKeySchema = StructType.fromAttributes(groupingAttributes)
+  private val groupingKeySchema = DataTypeUtils.fromAttributes(groupingAttributes)
   private val declFunctions = aggregateExpressions.map(_.aggregateFunction)
     .filter(_.isInstanceOf[DeclarativeAggregate])
     .map(_.asInstanceOf[DeclarativeAggregate])
-  private val bufferSchema = StructType.fromAttributes(aggregateBufferAttributes)
+  private val bufferSchema = DataTypeUtils.fromAttributes(aggregateBufferAttributes)
 
   // The name for Fast HashMap
   private var fastHashMapTerm: String = _
@@ -204,7 +209,7 @@ case class HashAggregateExec(
     metrics.incPeakExecutionMemory(maxMemory)
 
     // Update average hashmap probe
-    avgHashProbe.set(hashMap.getAvgHashProbeBucketListIterations)
+    avgHashProbe.set(hashMap.getAvgHashProbesPerKey)
 
     if (sorter == null) {
       // not spilled
@@ -376,12 +381,11 @@ case class HashAggregateExec(
    * Currently fast hash map is supported for primitive data types during partial aggregation.
    * This list of supported use-cases should be expanded over time.
    */
-  private def checkIfFastHashMapSupported(ctx: CodegenContext): Boolean = {
+  private def checkIfFastHashMapSupported(): Boolean = {
     val isSupported =
       (groupingKeySchema ++ bufferSchema).forall(f => CodeGenerator.isPrimitiveType(f.dataType) ||
         f.dataType.isInstanceOf[DecimalType] || f.dataType.isInstanceOf[StringType] ||
-        f.dataType.isInstanceOf[CalendarIntervalType]) &&
-        bufferSchema.nonEmpty
+        f.dataType.isInstanceOf[CalendarIntervalType])
 
     // For vectorized hash map, We do not support byte array based decimal type for aggregate values
     // as ColumnVector.putDecimal for high-precision decimals doesn't currently support in-place
@@ -402,8 +406,8 @@ case class HashAggregateExec(
     isSupported && isNotByteArrayDecimalType && isEnabledForAggModes
   }
 
-  private def enableTwoLevelHashMap(ctx: CodegenContext): Unit = {
-    if (!checkIfFastHashMapSupported(ctx)) {
+  private def enableTwoLevelHashMap(): Unit = {
+    if (!checkIfFastHashMapSupported()) {
       if (!Utils.isTesting) {
         logInfo(s"${SQLConf.ENABLE_TWOLEVEL_AGG_MAP.key} is set to true, but"
           + " current version of codegened fast hashmap does not support this aggregate.")
@@ -417,10 +421,12 @@ case class HashAggregateExec(
     }
   }
 
+  protected override def needHashTable: Boolean = true
+
   protected override def doProduceWithKeys(ctx: CodegenContext): String = {
     val initAgg = ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "initAgg")
     if (conf.enableTwoLevelAggMap) {
-      enableTwoLevelHashMap(ctx)
+      enableTwoLevelHashMap()
     } else if (conf.enableVectorizedHashMap) {
       logWarning("Two level hashmap is disabled but vectorized hashmap is enabled.")
     }
@@ -562,11 +568,11 @@ case class HashAggregateExec(
       ctx.currentVars = null
       ctx.INPUT_ROW = row
       val generateKeyRow = GenerateUnsafeProjection.createCode(ctx,
-        groupingKeySchema.toAttributes.zipWithIndex
+        toAttributes(groupingKeySchema).zipWithIndex
           .map { case (attr, i) => BoundReference(i, attr.dataType, attr.nullable) }
       )
       val generateBufferRow = GenerateUnsafeProjection.createCode(ctx,
-        bufferSchema.toAttributes.zipWithIndex.map { case (attr, i) =>
+        toAttributes(bufferSchema).zipWithIndex.map { case (attr, i) =>
           BoundReference(groupingKeySchema.length + i, attr.dataType, attr.nullable)
         })
       s"""
@@ -880,11 +886,4 @@ case class HashAggregateExec(
 
   override protected def withNewChildInternal(newChild: SparkPlan): HashAggregateExec =
     copy(child = newChild)
-}
-
-object HashAggregateExec {
-  def supportsAggregate(aggregateBufferAttributes: Seq[Attribute]): Boolean = {
-    val aggregationBufferSchema = StructType.fromAttributes(aggregateBufferAttributes)
-    UnsafeFixedWidthAggregationMap.supportsAggregationBufferSchema(aggregationBufferSchema)
-  }
 }

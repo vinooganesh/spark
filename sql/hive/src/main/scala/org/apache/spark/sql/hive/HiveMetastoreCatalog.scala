@@ -30,10 +30,12 @@ import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.{QualifiedTableName, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.parquet.{ParquetFileFormat, ParquetOptions}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.HiveCaseSensitiveInferenceMode._
+import org.apache.spark.sql.internal.SQLConf.PartitionOverwriteMode
 import org.apache.spark.sql.types._
 
 /**
@@ -88,7 +90,7 @@ private[hive] class HiveMetastoreCatalog(sparkSession: SparkSession) extends Log
             // we will use the cached relation.
             val useCached =
               relation.location.rootPaths.toSet == pathsInMetastore.toSet &&
-                logical.schema.sameType(schemaInMetastore) &&
+                DataTypeUtils.sameType(logical.schema, schemaInMetastore) &&
                 // We don't support hive bucketed tables. This function `getCached` is only used for
                 // converting supported Hive tables to data source tables.
                 relation.bucketSpec.isEmpty &&
@@ -152,6 +154,32 @@ private[hive] class HiveMetastoreCatalog(sparkSession: SparkSession) extends Log
           classOf[org.apache.spark.sql.hive.orc.OrcFileFormat],
           "orc",
           isWrite)
+      }
+    }
+  }
+
+  def convertStorageFormat(storage: CatalogStorageFormat): CatalogStorageFormat = {
+    val serde = storage.serde.getOrElse("").toLowerCase(Locale.ROOT)
+
+    if (serde.contains("parquet")) {
+      val options = storage.properties + (ParquetOptions.MERGE_SCHEMA ->
+        SQLConf.get.getConf(HiveUtils.CONVERT_METASTORE_PARQUET_WITH_SCHEMA_MERGING).toString)
+      storage.copy(
+        serde = None,
+        properties = options
+      )
+    } else {
+      val options = storage.properties
+      if (SQLConf.get.getConf(SQLConf.ORC_IMPLEMENTATION) == "native") {
+        storage.copy(
+          serde = None,
+          properties = options
+        )
+      } else {
+        storage.copy(
+          serde = None,
+          properties = options
+        )
       }
     }
   }
@@ -222,7 +250,8 @@ private[hive] class HiveMetastoreCatalog(sparkSession: SparkSession) extends Log
 
           // Spark SQL's data source table now support static and dynamic partition insert. Source
           // table converted from Hive table should always use dynamic.
-          val enableDynamicPartition = hiveOptions.updated("partitionOverwriteMode", "dynamic")
+          val enableDynamicPartition = hiveOptions.updated(DataSourceUtils.PARTITION_OVERWRITE_MODE,
+            PartitionOverwriteMode.DYNAMIC.toString)
           val fsRelation = HadoopFsRelation(
             location = fileIndex,
             partitionSchema = partitionSchema,
@@ -310,7 +339,7 @@ private[hive] class HiveMetastoreCatalog(sparkSession: SparkSession) extends Log
         .inferSchema(
           sparkSession,
           options,
-          fileIndex.listFiles(Nil, Nil).flatMap(_.files))
+          fileIndex.listFiles(Nil, Nil).flatMap(_.files).map(_.fileStatus))
         .map(mergeWithMetastoreSchema(relation.tableMeta.dataSchema, _))
 
       inferredSchema match {

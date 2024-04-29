@@ -19,7 +19,7 @@ package org.apache.spark.util
 
 import java.io._
 import java.lang.{Byte => JByte}
-import java.lang.management.{LockInfo, ManagementFactory, MonitorInfo, ThreadInfo}
+import java.lang.management.{LockInfo, ManagementFactory, MonitorInfo, PlatformManagedObject, ThreadInfo}
 import java.lang.reflect.InvocationTargetException
 import java.math.{MathContext, RoundingMode}
 import java.net._
@@ -54,6 +54,8 @@ import org.apache.commons.lang3.SystemUtils
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, FileUtil, Path}
 import org.apache.hadoop.io.compress.{CompressionCodecFactory, SplittableCompressionCodec}
+import org.apache.hadoop.ipc.{CallerContext => HadoopCallerContext}
+import org.apache.hadoop.ipc.CallerContext.{Builder => HadoopCallerContextBuilder}
 import org.apache.hadoop.security.UserGroupInformation
 import org.apache.hadoop.util.{RunJar, StringUtils}
 import org.apache.hadoop.yarn.conf.YarnConfiguration
@@ -74,6 +76,7 @@ import org.apache.spark.launcher.SparkLauncher
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.serializer.{DeserializationStream, SerializationStream, Serializer, SerializerInstance}
 import org.apache.spark.status.api.v1.{StackTrace, ThreadStackTrace}
+import org.apache.spark.util.collection.{Utils => CUtils}
 import org.apache.spark.util.io.ChunkedByteBufferOutputStream
 
 /** CallSite represents a place in user code. It can have a short and a long form. */
@@ -88,8 +91,12 @@ private[spark] object CallSite {
 /**
  * Various utility methods used by Spark.
  */
-private[spark] object Utils extends Logging {
-  val random = new Random()
+private[spark] object Utils
+  extends Logging
+  with SparkClassUtils
+  with SparkErrorUtils
+  with SparkFileUtils
+  with SparkSerDeUtils {
 
   private val sparkUncaughtExceptionHandler = new SparkUncaughtExceptionHandler
   @volatile private var cachedLocalDir: String = ""
@@ -110,35 +117,11 @@ private[spark] object Utils extends Logging {
 
   private val PATTERN_FOR_COMMAND_LINE_ARG = "-D(.+?)=(.+)".r
 
-  /** Serialize an object using Java serialization */
-  def serialize[T](o: T): Array[Byte] = {
-    val bos = new ByteArrayOutputStream()
-    val oos = new ObjectOutputStream(bos)
-    oos.writeObject(o)
-    oos.close()
-    bos.toByteArray
-  }
+  private val COPY_BUFFER_LEN = 1024
 
-  /** Deserialize an object using Java serialization */
-  def deserialize[T](bytes: Array[Byte]): T = {
-    val bis = new ByteArrayInputStream(bytes)
-    val ois = new ObjectInputStream(bis)
-    ois.readObject.asInstanceOf[T]
-  }
-
-  /** Deserialize an object using Java serialization and the given ClassLoader */
-  def deserialize[T](bytes: Array[Byte], loader: ClassLoader): T = {
-    val bis = new ByteArrayInputStream(bytes)
-    val ois = new ObjectInputStream(bis) {
-      override def resolveClass(desc: ObjectStreamClass): Class[_] = {
-        // scalastyle:off classforname
-        Class.forName(desc.getName, false, loader)
-        // scalastyle:on classforname
-      }
-    }
-    ois.readObject.asInstanceOf[T]
-  }
-
+  private val copyBuffer = ThreadLocal.withInitial[Array[Byte]](() => {
+    new Array[Byte](COPY_BUFFER_LEN)
+  })
   /** Deserialize a Long value (used for [[org.apache.spark.api.python.PythonPartitioner]]) */
   def deserializeLongValue(bytes: Array[Byte]) : Long = {
     // Note: we assume that we are given a Long value encoded in network (big-endian) byte order
@@ -186,44 +169,6 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Get the ClassLoader which loaded Spark.
-   */
-  def getSparkClassLoader: ClassLoader = getClass.getClassLoader
-
-  /**
-   * Get the Context ClassLoader on this thread or, if not present, the ClassLoader that
-   * loaded Spark.
-   *
-   * This should be used whenever passing a ClassLoader to Class.ForName or finding the currently
-   * active loader when setting up ClassLoader delegation chains.
-   */
-  def getContextOrSparkClassLoader: ClassLoader =
-    Option(Thread.currentThread().getContextClassLoader).getOrElse(getSparkClassLoader)
-
-  /** Determines whether the provided class is loadable in the current thread. */
-  def classIsLoadable(clazz: String): Boolean = {
-    Try { classForName(clazz, initialize = false) }.isSuccess
-  }
-
-  // scalastyle:off classforname
-  /**
-   * Preferred alternative to Class.forName(className), as well as
-   * Class.forName(className, initialize, loader) with current thread's ContextClassLoader.
-   */
-  def classForName[C](
-      className: String,
-      initialize: Boolean = true,
-      noSparkClassLoader: Boolean = false): Class[C] = {
-    if (!noSparkClassLoader) {
-      Class.forName(className, initialize, getContextOrSparkClassLoader).asInstanceOf[Class[C]]
-    } else {
-      Class.forName(className, initialize, Thread.currentThread().getContextClassLoader).
-        asInstanceOf[Class[C]]
-    }
-    // scalastyle:on classforname
-  }
-
-  /**
    * Run a segment of code using a different context class loader in the current thread
    */
   def withContextClassLoader[T](ctxClassLoader: ClassLoader)(fn: => T): T = {
@@ -236,34 +181,39 @@ private[spark] object Utils extends Logging {
     }
   }
 
+  private def writeByteBufferImpl(bb: ByteBuffer, writer: (Array[Byte], Int, Int) => Unit): Unit = {
+    if (bb.hasArray) {
+      // Avoid extra copy if the bytebuffer is backed by bytes array
+      writer(bb.array(), bb.arrayOffset() + bb.position(), bb.remaining())
+    } else {
+      // Fallback to copy approach
+      val buffer = {
+        // reuse the copy buffer from thread local
+        copyBuffer.get()
+      }
+      val originalPosition = bb.position()
+      var bytesToCopy = Math.min(bb.remaining(), COPY_BUFFER_LEN)
+      while (bytesToCopy > 0) {
+        bb.get(buffer, 0, bytesToCopy)
+        writer(buffer, 0, bytesToCopy)
+        bytesToCopy = Math.min(bb.remaining(), COPY_BUFFER_LEN)
+      }
+      bb.position(originalPosition)
+    }
+  }
+
   /**
    * Primitive often used when writing [[java.nio.ByteBuffer]] to [[java.io.DataOutput]]
    */
   def writeByteBuffer(bb: ByteBuffer, out: DataOutput): Unit = {
-    if (bb.hasArray) {
-      out.write(bb.array(), bb.arrayOffset() + bb.position(), bb.remaining())
-    } else {
-      val originalPosition = bb.position()
-      val bbval = new Array[Byte](bb.remaining())
-      bb.get(bbval)
-      out.write(bbval)
-      bb.position(originalPosition)
-    }
+    writeByteBufferImpl(bb, out.write)
   }
 
   /**
    * Primitive often used when writing [[java.nio.ByteBuffer]] to [[java.io.OutputStream]]
    */
   def writeByteBuffer(bb: ByteBuffer, out: OutputStream): Unit = {
-    if (bb.hasArray) {
-      out.write(bb.array(), bb.arrayOffset() + bb.position(), bb.remaining())
-    } else {
-      val originalPosition = bb.position()
-      val bbval = new Array[Byte](bb.remaining())
-      bb.get(bbval)
-      out.write(bbval)
-      bb.position(originalPosition)
-    }
+    writeByteBufferImpl(bb, out.write)
   }
 
   /**
@@ -282,61 +232,10 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Create a directory given the abstract pathname
-   * @return true, if the directory is successfully created; otherwise, return false.
-   */
-  def createDirectory(dir: File): Boolean = {
-    try {
-      // SPARK-35907: The check was required by File.mkdirs() because it could sporadically
-      // fail silently. After switching to Files.createDirectories(), ideally, there should
-      // no longer be silent fails. But the check is kept for the safety concern. We can
-      // remove the check when we're sure that Files.createDirectories() would never fail silently.
-      Files.createDirectories(dir.toPath)
-      if ( !dir.exists() || !dir.isDirectory) {
-        logError(s"Failed to create directory " + dir)
-      }
-      dir.isDirectory
-    } catch {
-      case e: Exception =>
-        logError(s"Failed to create directory " + dir, e)
-        false
-    }
-  }
-
-  /**
-   * Create a directory inside the given parent directory. The directory is guaranteed to be
-   * newly created, and is not marked for automatic deletion.
-   */
-  def createDirectory(root: String, namePrefix: String = "spark"): File = {
-    var attempts = 0
-    val maxAttempts = MAX_DIR_CREATION_ATTEMPTS
-    var dir: File = null
-    while (dir == null) {
-      attempts += 1
-      if (attempts > maxAttempts) {
-        throw new IOException("Failed to create a temp directory (under " + root + ") after " +
-          maxAttempts + " attempts!")
-      }
-      try {
-        dir = new File(root, namePrefix + "-" + UUID.randomUUID.toString)
-        // SPARK-35907:
-        // This could throw more meaningful exception information if directory creation failed.
-        Files.createDirectories(dir.toPath)
-      } catch {
-        case e @ (_ : IOException | _ : SecurityException) =>
-          logError(s"Failed to create directory $dir", e)
-          dir = null
-      }
-    }
-
-    dir.getCanonicalFile
-  }
-
-  /**
    * Create a temporary directory inside the given parent directory. The directory will be
    * automatically deleted when the VM shuts down.
    */
-  def createTempDir(
+  override def createTempDir(
       root: String = System.getProperty("java.io.tmpdir"),
       namePrefix: String = "spark"): File = {
     val dir = createDirectory(root, namePrefix)
@@ -355,26 +254,26 @@ private[spark] object Utils extends Logging {
       closeStreams: Boolean = false,
       transferToEnabled: Boolean = false): Long = {
     tryWithSafeFinally {
-      if (in.isInstanceOf[FileInputStream] && out.isInstanceOf[FileOutputStream]
-        && transferToEnabled) {
-        // When both streams are File stream, use transferTo to improve copy performance.
-        val inChannel = in.asInstanceOf[FileInputStream].getChannel()
-        val outChannel = out.asInstanceOf[FileOutputStream].getChannel()
-        val size = inChannel.size()
-        copyFileStreamNIO(inChannel, outChannel, 0, size)
-        size
-      } else {
-        var count = 0L
-        val buf = new Array[Byte](8192)
-        var n = 0
-        while (n != -1) {
-          n = in.read(buf)
-          if (n != -1) {
-            out.write(buf, 0, n)
-            count += n
+      (in, out) match {
+        case (input: FileInputStream, output: FileOutputStream) if transferToEnabled =>
+          // When both streams are File stream, use transferTo to improve copy performance.
+          val inChannel = input.getChannel
+          val outChannel = output.getChannel
+          val size = inChannel.size()
+          copyFileStreamNIO(inChannel, outChannel, 0, size)
+          size
+        case (input, output) =>
+          var count = 0L
+          val buf = new Array[Byte](8192)
+          var n = 0
+          while (n != -1) {
+            n = input.read(buf)
+            if (n != -1) {
+              output.write(buf, 0, n)
+              count += n
+            }
           }
-        }
-        count
+          count
       }
     } {
       if (closeStreams) {
@@ -479,7 +378,18 @@ private[spark] object Utils extends Logging {
     // `file` and `localhost` are not used. Just to prevent URI from parsing `fileName` as
     // scheme or host. The prefix "/" is required because URI doesn't accept a relative path.
     // We should remove it after we get the raw path.
-    new URI("file", null, "localhost", -1, "/" + fileName, null, null).getRawPath.substring(1)
+    encodeRelativeUnixPathToURIRawPath(fileName)
+  }
+
+  /**
+   * Same as [[encodeFileNameToURIRawPath]] but returns the relative UNIX path.
+   */
+  def encodeRelativeUnixPathToURIRawPath(path: String): String = {
+    require(!path.startsWith("/") && !path.contains("\\"))
+    // `file` and `localhost` are not used. Just to prevent URI from parsing `fileName` as
+    // scheme or host. The prefix "/" is required because URI doesn't accept a relative path.
+    // We should remove it after we get the raw path.
+    new URI("file", null, "localhost", -1, "/" + path, null, null).getRawPath.substring(1)
   }
 
   /**
@@ -593,17 +503,46 @@ private[spark] object Utils extends Logging {
    * basically copied from `org.apache.hadoop.yarn.util.FSDownload.unpack`.
    */
   def unpack(source: File, dest: File): Unit = {
+    if (!source.exists()) {
+      throw new FileNotFoundException(source.getAbsolutePath)
+    }
     val lowerSrc = StringUtils.toLowerCase(source.getName)
     if (lowerSrc.endsWith(".jar")) {
       RunJar.unJar(source, dest, RunJar.MATCH_ANY)
     } else if (lowerSrc.endsWith(".zip")) {
+      // After issue HADOOP-18145, unzip could keep file permissions.
       FileUtil.unZip(source, dest)
-    } else if (
-      lowerSrc.endsWith(".tar.gz") || lowerSrc.endsWith(".tgz") || lowerSrc.endsWith(".tar")) {
+    } else if (lowerSrc.endsWith(".tar.gz") || lowerSrc.endsWith(".tgz")) {
       FileUtil.unTar(source, dest)
+    } else if (lowerSrc.endsWith(".tar")) {
+      // TODO(SPARK-38632): should keep file permissions. Java implementation doesn't.
+      unTarUsingJava(source, dest)
     } else {
       logWarning(s"Cannot unpack $source, just copying it to $dest.")
       copyRecursive(source, dest)
+    }
+  }
+
+  /**
+   * The method below was copied from `FileUtil.unTar` but uses Java-based implementation
+   * to work around a security issue, see also SPARK-38631.
+   */
+  private def unTarUsingJava(source: File, dest: File): Unit = {
+    if (!dest.mkdirs && !dest.isDirectory) {
+      throw new IOException(s"Mkdirs failed to create $dest")
+    } else {
+      try {
+        // Should not fail because all Hadoop 2.1+ (from HADOOP-9264)
+        // have 'unTarUsingJava'.
+        val mth = classOf[FileUtil].getDeclaredMethod(
+          "unTarUsingJava", classOf[File], classOf[File], classOf[Boolean])
+        mth.setAccessible(true)
+        mth.invoke(null, source, dest, java.lang.Boolean.FALSE)
+      } catch {
+        // Re-throw the original exception.
+        case e: java.lang.reflect.InvocationTargetException if e.getCause != null =>
+          throw e.getCause
+      }
     }
   }
 
@@ -1065,21 +1004,48 @@ private[spark] object Utils extends Logging {
    * Get the local machine's FQDN.
    */
   def localCanonicalHostName(): String = {
-    customHostname.getOrElse(localIpAddress.getCanonicalHostName)
+    addBracketsIfNeeded(customHostname.getOrElse(localIpAddress.getCanonicalHostName))
   }
 
   /**
    * Get the local machine's hostname.
+   * In case of IPv6, getHostAddress may return '0:0:0:0:0:0:0:1'.
    */
   def localHostName(): String = {
-    customHostname.getOrElse(localIpAddress.getHostAddress)
+    addBracketsIfNeeded(customHostname.getOrElse(localIpAddress.getHostAddress))
   }
 
   /**
    * Get the local machine's URI.
    */
   def localHostNameForURI(): String = {
-    customHostname.getOrElse(InetAddresses.toUriString(localIpAddress))
+    addBracketsIfNeeded(customHostname.getOrElse(InetAddresses.toUriString(localIpAddress)))
+  }
+
+  private[spark] def addBracketsIfNeeded(addr: String): String = {
+    if (addr.contains(":") && !addr.contains("[")) {
+      "[" + addr + "]"
+    } else {
+      addr
+    }
+  }
+
+  /**
+   * Normalize IPv6 IPs and no-op on all other hosts.
+   */
+  private[spark] def normalizeIpIfNeeded(host: String): String = {
+    // Is this a v6 address. We ask users to add [] around v6 addresses as strs but
+    // there not always there. If it's just 0-9 and : and [] we treat it as a v6 address.
+    // This means some invalid addresses are treated as v6 addresses, but since they are
+    // not valid hostnames it doesn't matter.
+    // See https://www.rfc-editor.org/rfc/rfc1123#page-13 for context around valid hostnames.
+    val addressRe = """^\[{0,1}([0-9:]+?:[0-9]*)\]{0,1}$""".r
+    host match {
+      case addressRe(unbracketed) =>
+        addBracketsIfNeeded(InetAddresses.toAddrString(InetAddresses.forString(unbracketed)))
+      case _ =>
+        host
+    }
   }
 
   /**
@@ -1152,29 +1118,13 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Lists files recursively.
-   */
-  def recursiveList(f: File): Array[File] = {
-    require(f.isDirectory)
-    val result = f.listFiles.toBuffer
-    val dirList = result.filter(_.isDirectory)
-    while (dirList.nonEmpty) {
-      val curDir = dirList.remove(0)
-      val files = curDir.listFiles()
-      result ++= files
-      dirList ++= files.filter(_.isDirectory)
-    }
-    result.toArray
-  }
-
-  /**
    * Delete a file or directory and its contents recursively.
    * Don't follow directories if they are symlinks.
    * Throws an exception if deletion is unsuccessful.
    */
-  def deleteRecursively(file: File): Unit = {
+  override def deleteRecursively(file: File): Unit = {
+    super.deleteRecursively(file)
     if (file != null) {
-      JavaUtils.deleteRecursively(file)
       ShutdownHookManager.removeShutdownDeleteDir(file)
     }
   }
@@ -1260,41 +1210,30 @@ private[spark] object Utils extends Logging {
     (JavaUtils.byteStringAsBytes(str) / 1024 / 1024).toInt
   }
 
+  private[this] val siByteSizes =
+    Array(1L << 60, 1L << 50, 1L << 40, 1L << 30, 1L << 20, 1L << 10, 1)
+  private[this] val siByteSuffixes =
+    Array("EiB", "PiB", "TiB", "GiB", "MiB", "KiB", "B")
   /**
    * Convert a quantity in bytes to a human-readable string such as "4.0 MiB".
    */
-  def bytesToString(size: Long): String = bytesToString(BigInt(size))
+  def bytesToString(size: Long): String = {
+    var i = 0
+    while (i < siByteSizes.length - 1 && size < 2 * siByteSizes(i)) i += 1
+    "%.1f %s".formatLocal(Locale.US, size.toDouble / siByteSizes(i), siByteSuffixes(i))
+  }
 
   def bytesToString(size: BigInt): String = {
     val EiB = 1L << 60
-    val PiB = 1L << 50
-    val TiB = 1L << 40
-    val GiB = 1L << 30
-    val MiB = 1L << 20
-    val KiB = 1L << 10
-
-    if (size >= BigInt(1L << 11) * EiB) {
+    if (size.isValidLong) {
+      // Common case, most sizes fit in 64 bits and all ops on BigInt are order(s) of magnitude
+      // slower than Long/Double.
+      bytesToString(size.toLong)
+    } else if (size < BigInt(2L << 10) * EiB) {
+      "%.1f EiB".formatLocal(Locale.US, BigDecimal(size) / EiB)
+    } else {
       // The number is too large, show it in scientific notation.
       BigDecimal(size, new MathContext(3, RoundingMode.HALF_UP)).toString() + " B"
-    } else {
-      val (value, unit) = {
-        if (size >= 2 * EiB) {
-          (BigDecimal(size) / EiB, "EiB")
-        } else if (size >= 2 * PiB) {
-          (BigDecimal(size) / PiB, "PiB")
-        } else if (size >= 2 * TiB) {
-          (BigDecimal(size) / TiB, "TiB")
-        } else if (size >= 2 * GiB) {
-          (BigDecimal(size) / GiB, "GiB")
-        } else if (size >= 2 * MiB) {
-          (BigDecimal(size) / MiB, "MiB")
-        } else if (size >= 2 * KiB) {
-          (BigDecimal(size) / KiB, "KiB")
-        } else {
-          (BigDecimal(size), "B")
-        }
-      }
-      "%.1f %s".formatLocal(Locale.US, value, unit)
     }
   }
 
@@ -1430,25 +1369,6 @@ private[spark] object Utils extends Logging {
     }
   }
 
-  /**
-   * Execute a block of code that returns a value, re-throwing any non-fatal uncaught
-   * exceptions as IOException. This is used when implementing Externalizable and Serializable's
-   * read and write methods, since Java's serializer will not report non-IOExceptions properly;
-   * see SPARK-4080 for more context.
-   */
-  def tryOrIOException[T](block: => T): T = {
-    try {
-      block
-    } catch {
-      case e: IOException =>
-        logError("Exception encountered", e)
-        throw e
-      case NonFatal(e) =>
-        logError("Exception encountered", e)
-        throw new IOException(e)
-    }
-  }
-
   /** Executes the given block. Log non-fatal errors if any, and only throw fatal errors */
   def tryLogNonFatalError(block: => Unit): Unit = {
     try {
@@ -1456,38 +1376,6 @@ private[spark] object Utils extends Logging {
     } catch {
       case NonFatal(t) =>
         logError(s"Uncaught exception in thread ${Thread.currentThread().getName}", t)
-    }
-  }
-
-  /**
-   * Execute a block of code, then a finally block, but if exceptions happen in
-   * the finally block, do not suppress the original exception.
-   *
-   * This is primarily an issue with `finally { out.close() }` blocks, where
-   * close needs to be called to clean up `out`, but if an exception happened
-   * in `out.write`, it's likely `out` may be corrupted and `out.close` will
-   * fail as well. This would then suppress the original/likely more meaningful
-   * exception from the original `out.write` call.
-   */
-  def tryWithSafeFinally[T](block: => T)(finallyBlock: => Unit): T = {
-    var originalThrowable: Throwable = null
-    try {
-      block
-    } catch {
-      case t: Throwable =>
-        // Purposefully not using NonFatal, because even fatal exceptions
-        // we don't want to have our finallyBlock suppress
-        originalThrowable = t
-        throw originalThrowable
-    } finally {
-      try {
-        finallyBlock
-      } catch {
-        case t: Throwable if (originalThrowable != null && originalThrowable != t) =>
-          originalThrowable.addSuppressed(t)
-          logWarning(s"Suppressing exception in finally: ${t.getMessage}", t)
-          throw originalThrowable
-      }
     }
   }
 
@@ -1703,7 +1591,8 @@ private[spark] object Utils extends Logging {
     assert(files.length == fileLengths.length)
     val startIndex = math.max(start, 0)
     val endIndex = math.min(end, fileLengths.sum)
-    val fileToLength = files.zip(fileLengths).toMap
+    val fileToLength = CUtils.toMap(files, fileLengths)
+
     logDebug("Log files: \n" + fileToLength.mkString("\n"))
 
     val stringBuffer = new StringBuffer((endIndex - startIndex).toInt)
@@ -1893,18 +1782,9 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Counts the number of elements of an iterator using a while loop rather than calling
-   * [[scala.collection.Iterator#size]] because it uses a for loop, which is slightly slower
-   * in the current version of Scala.
+   * Counts the number of elements of an iterator.
    */
-  def getIteratorSize(iterator: Iterator[_]): Long = {
-    var count = 0L
-    while (iterator.hasNext) {
-      count += 1L
-      iterator.next()
-    }
-    count
-  }
+  def getIteratorSize(iterator: Iterator[_]): Long = Iterators.size(iterator)
 
   /**
    * Generate a zipWithIndex iterator, avoid index value overflowing problem
@@ -1969,9 +1849,20 @@ private[spark] object Utils extends Logging {
   val isMac = SystemUtils.IS_OS_MAC_OSX
 
   /**
+   * Whether the underlying Java version is at least 21.
+   */
+  val isJavaVersionAtLeast21 =
+    System.getProperty("java.version").split("[+.\\-]+", 3)(0).toInt >= 21
+
+  /**
    * Whether the underlying operating system is Mac OS X and processor is Apple Silicon.
    */
   val isMacOnAppleSilicon = SystemUtils.IS_OS_MAC_OSX && SystemUtils.OS_ARCH.equals("aarch64")
+
+  /**
+   * Whether the underlying JVM prefer IPv6 addresses.
+   */
+  val preferIPv6 = "true".equals(System.getProperty("java.net.preferIPv6Addresses"))
 
   /**
    * Pattern for matching a Windows drive, which contains only a single alphabet character.
@@ -2070,31 +1961,6 @@ private[spark] object Utils extends Logging {
       case _ =>
         true
     }
-  }
-
-  /**
-   * Return a well-formed URI for the file described by a user input string.
-   *
-   * If the supplied path does not contain a scheme, or is a relative path, it will be
-   * converted into an absolute path with a file:// scheme.
-   */
-  def resolveURI(path: String): URI = {
-    try {
-      val uri = new URI(path)
-      if (uri.getScheme() != null) {
-        return uri
-      }
-      // make sure to handle if the path has a fragment (applies to yarn
-      // distributed cache)
-      if (uri.getFragment() != null) {
-        val absoluteURI = new File(uri.getPath()).getAbsoluteFile().toURI()
-        return new URI(absoluteURI.getScheme(), absoluteURI.getHost(), absoluteURI.getPath(),
-          uri.getFragment())
-      }
-    } catch {
-      case e: URISyntaxException =>
-    }
-    new File(path).getCanonicalFile().toURI()
   }
 
   /** Resolve a comma-separated list of paths. */
@@ -2242,9 +2108,9 @@ private[spark] object Utils extends Logging {
     def lockString: String = {
       lock match {
         case monitor: MonitorInfo =>
-          s"Monitor(${lock.getClassName}@${lock.getIdentityHashCode}})"
+          s"Monitor(${lock.getClassName}@${monitor.getIdentityHashCode})"
         case _ =>
-          s"Lock(${lock.getClassName}@${lock.getIdentityHashCode}})"
+          s"Lock(${lock.getClassName}@${lock.getIdentityHashCode})"
       }
     }
   }
@@ -2270,6 +2136,24 @@ private[spark] object Utils extends Logging {
           v1 > v2
         }
     }.map(threadInfoToThreadStackTrace)
+  }
+
+  /** Return a heap dump. Used to capture dumps for the web UI */
+  def getHeapHistogram(): Array[String] = {
+    // From Java 9+, we can use 'ProcessHandle.current().pid()'
+    val pid = getProcessName().split("@").head
+    val jmap = System.getProperty("java.home") + "/bin/jmap"
+    val builder = new ProcessBuilder(jmap, "-histo:live", pid)
+    val p = builder.start()
+    val rows = ArrayBuffer.empty[String]
+    Utils.tryWithResource(new BufferedReader(new InputStreamReader(p.getInputStream()))) { r =>
+      var line = ""
+      while (line != null) {
+        if (line.nonEmpty) rows += line
+        line = r.readLine()
+      }
+    }
+    rows.toArray
   }
 
   def getThreadDumpForThread(threadId: Long): Option[ThreadStackTrace] = {
@@ -2730,11 +2614,6 @@ private[spark] object Utils extends Logging {
     initialExecutors
   }
 
-  def tryWithResource[R <: Closeable, T](createResource: => R)(f: R => T): T = {
-    val resource = createResource
-    try f.apply(resource) finally resource.close()
-  }
-
   /**
    * Returns a path of temporary file which is in the same directory with `path`.
    */
@@ -2784,7 +2663,8 @@ private[spark] object Utils extends Logging {
    * Redact the sensitive values in the given map. If a map key matches the redaction pattern then
    * its value is replaced with a dummy text.
    */
-  def redact(conf: SparkConf, kvs: Seq[(String, String)]): Seq[(String, String)] = {
+  def redact(conf: SparkConf,
+      kvs: scala.collection.Seq[(String, String)]): scala.collection.Seq[(String, String)] = {
     val redactionPattern = conf.get(SECRET_REDACTION_PATTERN)
     redact(redactionPattern, kvs)
   }
@@ -2793,7 +2673,8 @@ private[spark] object Utils extends Logging {
    * Redact the sensitive values in the given map. If a map key matches the redaction pattern then
    * its value is replaced with a dummy text.
    */
-  def redact[K, V](regex: Option[Regex], kvs: Seq[(K, V)]): Seq[(K, V)] = {
+  def redact[K, V](regex: Option[Regex],
+      kvs: scala.collection.Seq[(K, V)]): scala.collection.Seq[(K, V)] = {
     regex match {
       case None => kvs
       case Some(r) => redact(r, kvs)
@@ -2815,7 +2696,8 @@ private[spark] object Utils extends Logging {
     }
   }
 
-  private def redact[K, V](redactionPattern: Regex, kvs: Seq[(K, V)]): Seq[(K, V)] = {
+  private def redact[K, V](redactionPattern: Regex,
+      kvs: scala.collection.Seq[(K, V)]): scala.collection.Seq[(K, V)] = {
     // If the sensitive information regex matches with either the key or the value, redact the value
     // While the original intent was to only redact the value if the key matched with the regex,
     // we've found that especially in verbose mode, the value of the property may contain sensitive
@@ -2841,7 +2723,7 @@ private[spark] object Utils extends Logging {
           .getOrElse((key, value))
       case (key, value) =>
         (key, value)
-    }.asInstanceOf[Seq[(K, V)]]
+    }.asInstanceOf[scala.collection.Seq[(K, V)]]
   }
 
   /**
@@ -2850,7 +2732,7 @@ private[spark] object Utils extends Logging {
    * redacted. So theoretically, the property itself could be configured to redact its own value
    * when printing.
    */
-  def redact(kvs: Map[String, String]): Seq[(String, String)] = {
+  def redact(kvs: Map[String, String]): scala.collection.Seq[(String, String)] = {
     val redactionPattern = kvs.getOrElse(
       SECRET_REDACTION_PATTERN.key,
       SECRET_REDACTION_PATTERN.defaultValueString
@@ -2985,34 +2867,6 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Returns true if and only if the underlying class is a member class.
-   *
-   * Note: jdk8u throws a "Malformed class name" error if a given class is a deeply-nested
-   * inner class (See SPARK-34607 for details). This issue has already been fixed in jdk9+, so
-   * we can remove this helper method safely if we drop the support of jdk8u.
-   */
-  def isMemberClass(cls: Class[_]): Boolean = {
-    try {
-      cls.isMemberClass
-    } catch {
-      case _: InternalError =>
-        // We emulate jdk8u `Class.isMemberClass` below:
-        //   public boolean isMemberClass() {
-        //     return getSimpleBinaryName() != null && !isLocalOrAnonymousClass();
-        //   }
-        // `getSimpleBinaryName()` returns null if a given class is a top-level class,
-        // so we replace it with `cls.getEnclosingClass != null`. The second condition checks
-        // if a given class is not a local or an anonymous class, so we replace it with
-        // `cls.getEnclosingMethod == null` because `cls.getEnclosingMethod()` return a value
-        // only in either case (JVM Spec 4.8.6).
-        //
-        // Note: The newer jdk evaluates `!isLocalOrAnonymousClass()` first,
-        // we reorder the conditions to follow it.
-        cls.getEnclosingMethod == null && cls.getEnclosingClass != null
-    }
-  }
-
-  /**
    * Safer than Class obj's getSimpleName which may throw Malformed class name error in scala.
    * This method mimics scalatest's getSimpleNameOfAnObjectsClass.
    */
@@ -3040,7 +2894,7 @@ private[spark] object Utils extends Logging {
    * and return the trailing part after the last dollar sign in the middle
    */
   @scala.annotation.tailrec
-  private def stripDollars(s: String): String = {
+  def stripDollars(s: String): String = {
     val lastDollarIndex = s.lastIndexOf('$')
     if (lastDollarIndex < s.length - 1) {
       // The last char is not a dollar sign
@@ -3221,35 +3075,41 @@ private[spark] object Utils extends Logging {
    * Return the median number of a long array
    *
    * @param sizes
+   * @param alreadySorted
    * @return
    */
-  def median(sizes: Array[Long]): Long = {
+  def median(sizes: Array[Long], alreadySorted: Boolean): Long = {
     val len = sizes.length
-    val sortedSize = sizes.sorted
+    val sortedSize = if (alreadySorted) sizes else sizes.sorted
     len match {
       case _ if (len % 2 == 0) =>
         math.max((sortedSize(len / 2) + sortedSize(len / 2 - 1)) / 2, 1)
       case _ => math.max(sortedSize(len / 2), 1)
     }
   }
+
+  /**
+   * Return whether we are using G1GC or not
+   */
+  lazy val isG1GC: Boolean = {
+    Try {
+      val clazz = Utils.classForName("com.sun.management.HotSpotDiagnosticMXBean")
+        .asInstanceOf[Class[_ <: PlatformManagedObject]]
+      val vmOptionClazz = Utils.classForName("com.sun.management.VMOption")
+      val hotSpotDiagnosticMXBean = ManagementFactory.getPlatformMXBean(clazz)
+      val vmOptionMethod = clazz.getMethod("getVMOption", classOf[String])
+      val valueMethod = vmOptionClazz.getMethod("getValue")
+
+      val useG1GCObject = vmOptionMethod.invoke(hotSpotDiagnosticMXBean, "UseG1GC")
+      val useG1GC = valueMethod.invoke(useG1GCObject).asInstanceOf[String]
+      "true".equals(useG1GC)
+    }.getOrElse(false)
+  }
 }
 
 private[util] object CallerContext extends Logging {
-  val callerContextSupported: Boolean = {
-    SparkHadoopUtil.get.conf.getBoolean("hadoop.caller.context.enabled", false) && {
-      try {
-        Utils.classForName("org.apache.hadoop.ipc.CallerContext")
-        Utils.classForName("org.apache.hadoop.ipc.CallerContext$Builder")
-        true
-      } catch {
-        case _: ClassNotFoundException =>
-          false
-        case NonFatal(e) =>
-          logWarning("Fail to load the CallerContext class", e)
-          false
-      }
-    }
-  }
+  val callerContextEnabled: Boolean =
+    SparkHadoopUtil.get.conf.getBoolean("hadoop.caller.context.enabled", false)
 }
 
 /**
@@ -3309,22 +3169,11 @@ private[spark] class CallerContext(
 
   /**
    * Set up the caller context [[context]] by invoking Hadoop CallerContext API of
-   * [[org.apache.hadoop.ipc.CallerContext]], which was added in hadoop 2.8.
+   * [[HadoopCallerContext]].
    */
-  def setCurrentContext(): Unit = {
-    if (CallerContext.callerContextSupported) {
-      try {
-        val callerContext = Utils.classForName("org.apache.hadoop.ipc.CallerContext")
-        val builder: Class[AnyRef] =
-          Utils.classForName("org.apache.hadoop.ipc.CallerContext$Builder")
-        val builderInst = builder.getConstructor(classOf[String]).newInstance(context)
-        val hdfsContext = builder.getMethod("build").invoke(builderInst)
-        callerContext.getMethod("setCurrent", callerContext).invoke(null, hdfsContext)
-      } catch {
-        case NonFatal(e) =>
-          logWarning("Fail to set Spark caller context", e)
-      }
-    }
+  def setCurrentContext(): Unit = if (CallerContext.callerContextEnabled) {
+    val hdfsContext = new HadoopCallerContextBuilder(context).build()
+    HadoopCallerContext.setCurrent(hdfsContext)
   }
 }
 

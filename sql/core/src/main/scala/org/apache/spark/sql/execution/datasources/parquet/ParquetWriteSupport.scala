@@ -36,8 +36,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.SpecializedGetters
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.execution.datasources.DataSourceUtils
-import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.internal.SQLConf.LegacyBehaviorPolicy
+import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
 import org.apache.spark.sql.types._
 
 /**
@@ -252,8 +251,7 @@ class ParquetWriteSupport extends WriteSupport[InternalRow] with Logging {
 
       case t: UserDefinedType[_] => makeWriter(t.sqlType)
 
-      // TODO Adds IntervalType support
-      case _ => sys.error(s"Unsupported data type $dataType.")
+      case _ => throw new IllegalStateException(s"Unsupported data type $dataType.")
     }
   }
 

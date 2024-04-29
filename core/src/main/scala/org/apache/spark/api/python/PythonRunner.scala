@@ -44,6 +44,7 @@ private[spark] object PythonEvalType {
   val NON_UDF = 0
 
   val SQL_BATCHED_UDF = 100
+  val SQL_ARROW_BATCHED_UDF = 101
 
   val SQL_SCALAR_PANDAS_UDF = 200
   val SQL_GROUPED_MAP_PANDAS_UDF = 201
@@ -53,10 +54,15 @@ private[spark] object PythonEvalType {
   val SQL_MAP_PANDAS_ITER_UDF = 205
   val SQL_COGROUPED_MAP_PANDAS_UDF = 206
   val SQL_MAP_ARROW_ITER_UDF = 207
+  val SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE = 208
+
+  val SQL_TABLE_UDF = 300
+  val SQL_ARROW_TABLE_UDF = 301
 
   def toString(pythonEvalType: Int): String = pythonEvalType match {
     case NON_UDF => "NON_UDF"
     case SQL_BATCHED_UDF => "SQL_BATCHED_UDF"
+    case SQL_ARROW_BATCHED_UDF => "SQL_ARROW_BATCHED_UDF"
     case SQL_SCALAR_PANDAS_UDF => "SQL_SCALAR_PANDAS_UDF"
     case SQL_GROUPED_MAP_PANDAS_UDF => "SQL_GROUPED_MAP_PANDAS_UDF"
     case SQL_GROUPED_AGG_PANDAS_UDF => "SQL_GROUPED_AGG_PANDAS_UDF"
@@ -65,6 +71,9 @@ private[spark] object PythonEvalType {
     case SQL_MAP_PANDAS_ITER_UDF => "SQL_MAP_PANDAS_ITER_UDF"
     case SQL_COGROUPED_MAP_PANDAS_UDF => "SQL_COGROUPED_MAP_PANDAS_UDF"
     case SQL_MAP_ARROW_ITER_UDF => "SQL_MAP_ARROW_ITER_UDF"
+    case SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE => "SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE"
+    case SQL_TABLE_UDF => "SQL_TABLE_UDF"
+    case SQL_ARROW_TABLE_UDF => "SQL_ARROW_TABLE_UDF"
   }
 }
 
@@ -84,9 +93,10 @@ private object BasePythonRunner {
  * functions (from bottom to top).
  */
 private[spark] abstract class BasePythonRunner[IN, OUT](
-    funcs: Seq[ChainedPythonFunctions],
-    evalType: Int,
-    argOffsets: Array[Array[Int]])
+    protected val funcs: Seq[ChainedPythonFunctions],
+    protected val evalType: Int,
+    protected val argOffsets: Array[Array[Int]],
+    protected val jobArtifactUUID: Option[String])
   extends Logging {
 
   require(funcs.length == argOffsets.length, "argOffsets should have the same length as funcs")
@@ -133,12 +143,10 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
     val execCoresProp = Option(context.getLocalProperty(EXECUTOR_CORES_LOCAL_PROPERTY))
     val memoryMb = Option(context.getLocalProperty(PYSPARK_MEMORY_LOCAL_PROPERTY)).map(_.toLong)
     val localdir = env.blockManager.diskBlockManager.localDirs.map(f => f.getPath()).mkString(",")
-    // if OMP_NUM_THREADS is not explicitly set, override it with the number of cores
+    // If OMP_NUM_THREADS is not explicitly set, override it with the number of task cpus.
+    // See SPARK-42613 for details.
     if (conf.getOption("spark.executorEnv.OMP_NUM_THREADS").isEmpty) {
-      // SPARK-28843: limit the OpenMP thread pool to the number of cores assigned to this executor
-      // this avoids high memory consumption with pandas/numpy because of a large OpenMP thread pool
-      // see https://github.com/numpy/numpy/issues/10455
-      execCoresProp.foreach(envVars.put("OMP_NUM_THREADS", _))
+      envVars.put("OMP_NUM_THREADS", conf.get("spark.task.cpus", "1"))
     }
     envVars.put("SPARK_LOCAL_DIRS", localdir) // it's also used in monitor thread
     if (reuseWorker) {
@@ -159,6 +167,8 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
     if (faultHandlerEnabled) {
       envVars.put("PYTHON_FAULTHANDLER_DIR", BasePythonRunner.faultHandlerLogDir.toString)
     }
+
+    envVars.put("SPARK_JOB_ARTIFACT_UUID", jobArtifactUUID.getOrElse("default"))
 
     val (worker: Socket, pid: Option[Int]) = env.createPythonWorker(
       pythonExec, envVars.asScala.toMap)
@@ -183,6 +193,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
     }
 
     writerThread.start()
+    new WriterMonitorThread(SparkEnv.get, worker, writerThread, context).start()
     if (reuseWorker) {
       val key = (worker, context.taskAttemptId)
       // SPARK-35009: avoid creating multiple monitor threads for the same python worker
@@ -372,7 +383,10 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
         }
 
         // sparkFilesDir
-        PythonRDD.writeUTF(SparkFiles.getRootDirectory(), dataOut)
+        val root = jobArtifactUUID.map { uuid =>
+          new File(SparkFiles.getRootDirectory(), uuid).getAbsolutePath
+        }.getOrElse(SparkFiles.getRootDirectory())
+        PythonRDD.writeUTF(root, dataOut)
         // Python includes (*.zip and *.egg files)
         dataOut.writeInt(pythonIncludes.size)
         for (include <- pythonIncludes) {
@@ -400,6 +414,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
           // the decrypted data to python
           val idsAndFiles = broadcastVars.flatMap { broadcast =>
             if (!oldBids.contains(broadcast.id)) {
+              oldBids.add(broadcast.id)
               Some((broadcast.id, broadcast.value.path))
             } else {
               None
@@ -413,7 +428,6 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
           idsAndFiles.foreach { case (id, _) =>
             // send new broadcast
             dataOut.writeLong(id)
-            oldBids.add(id)
           }
           dataOut.flush()
           logTrace("waiting for python to read decrypted broadcast data from server")
@@ -555,7 +569,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
       val obj = new Array[Byte](exLength)
       stream.readFully(obj)
       new PythonException(new String(obj, StandardCharsets.UTF_8),
-        writerThread.exception.getOrElse(null))
+        writerThread.exception.orNull)
     }
 
     protected def handleEndOfDataSection(): Unit = {
@@ -646,6 +660,54 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
       }
     }
   }
+
+  /**
+   * This thread monitors the WriterThread and kills it in case of deadlock.
+   *
+   * A deadlock can arise if the task completes while the writer thread is sending input to the
+   * Python process (e.g. due to the use of `take()`), and the Python process is still producing
+   * output. When the inputs are sufficiently large, this can result in a deadlock due to the use of
+   * blocking I/O (SPARK-38677). To resolve the deadlock, we need to close the socket.
+   */
+  class WriterMonitorThread(
+      env: SparkEnv, worker: Socket, writerThread: WriterThread, context: TaskContext)
+    extends Thread(s"Writer Monitor for $pythonExec (writer thread id ${writerThread.getId})") {
+
+    /**
+     * How long to wait before closing the socket if the writer thread has not exited after the task
+     * ends.
+     */
+    private val taskKillTimeout = env.conf.get(PYTHON_TASK_KILL_TIMEOUT)
+
+    setDaemon(true)
+
+    override def run(): Unit = {
+      // Wait until the task is completed (or the writer thread exits, in which case this thread has
+      // nothing to do).
+      while (!context.isCompleted && writerThread.isAlive) {
+        Thread.sleep(2000)
+      }
+      if (writerThread.isAlive) {
+        Thread.sleep(taskKillTimeout)
+        // If the writer thread continues running, this indicates a deadlock. Kill the worker to
+        // resolve the deadlock.
+        if (writerThread.isAlive) {
+          try {
+            // Mimic the task name used in `Executor` to help the user find out the task to blame.
+            val taskName = s"${context.partitionId}.${context.attemptNumber} " +
+              s"in stage ${context.stageId} (TID ${context.taskAttemptId})"
+            logWarning(
+              s"Detected deadlock while completing task $taskName: " +
+                "Attempting to kill Python Worker")
+            env.destroyPythonWorker(pythonExec, envVars.asScala.toMap, worker)
+          } catch {
+            case e: Exception =>
+              logError("Exception when trying to kill worker", e)
+          }
+        }
+      }
+    }
+  }
 }
 
 private[spark] object PythonRunner {
@@ -653,17 +715,23 @@ private[spark] object PythonRunner {
   // already running worker monitor threads for worker and task attempts ID pairs
   val runningMonitorThreads = ConcurrentHashMap.newKeySet[(Socket, Long)]()
 
-  def apply(func: PythonFunction): PythonRunner = {
-    new PythonRunner(Seq(ChainedPythonFunctions(Seq(func))))
+  private var printPythonInfo: AtomicBoolean = new AtomicBoolean(true)
+
+  def apply(func: PythonFunction, jobArtifactUUID: Option[String]): PythonRunner = {
+    if (printPythonInfo.compareAndSet(true, false)) {
+      PythonUtils.logPythonInfo(func.pythonExec)
+    }
+    new PythonRunner(Seq(ChainedPythonFunctions(Seq(func))), jobArtifactUUID)
   }
 }
 
 /**
  * A helper class to run Python mapPartition in Spark.
  */
-private[spark] class PythonRunner(funcs: Seq[ChainedPythonFunctions])
+private[spark] class PythonRunner(
+    funcs: Seq[ChainedPythonFunctions], jobArtifactUUID: Option[String])
   extends BasePythonRunner[Array[Byte], Array[Byte]](
-    funcs, PythonEvalType.NON_UDF, Array(Array(0))) {
+    funcs, PythonEvalType.NON_UDF, Array(Array(0)), jobArtifactUUID) {
 
   protected override def newWriterThread(
       env: SparkEnv,
@@ -731,6 +799,7 @@ private[spark] object SpecialLengths {
   val END_OF_STREAM = -4
   val NULL = -5
   val START_ARROW_STREAM = -6
+  val END_OF_MICRO_BATCH = -7
 }
 
 private[spark] object BarrierTaskContextMessageProtocol {

@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.command.v1
 
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.execution.command
+import org.apache.spark.sql.execution.command.DDLCommandTestUtils.V1_COMMAND_VERSION
 
 /**
  * This base suite contains unified tests for the `SHOW CREATE TABLE` command that checks V1
@@ -31,7 +32,10 @@ import org.apache.spark.sql.execution.command
  */
 trait ShowCreateTableSuiteBase extends command.ShowCreateTableSuiteBase
     with command.TestsV1AndV2Commands {
-  override def fullName: String = s"`$ns`.`$table`"
+  override def fullName: String = commandVersion match {
+    case V1_COMMAND_VERSION => s"$ns.$table"
+    case _ => s"$catalog.$ns.$table"
+  }
 
   test("show create table[simple]") {
     // todo After SPARK-37517 unify the testcase both v1 and v2
@@ -53,16 +57,16 @@ trait ShowCreateTableSuiteBase extends command.ShowCreateTableSuiteBase
            |COMMENT 'This is a comment'
            |TBLPROPERTIES ('prop1' = '1', 'prop2' = '2', 'prop3' = 3, 'prop4' = 4)
            |PARTITIONED BY (a)
-           |LOCATION '/tmp'
+           |LOCATION 'file:/tmp'
         """.stripMargin)
       val showDDL = getShowCreateDDL(t)
       assert(showDDL === Array(
         s"CREATE TABLE $fullName (",
-        "`b` BIGINT,",
-        "`c` BIGINT,",
-        "`extraCol` ARRAY<INT>,",
-        "`<another>` STRUCT<`x`: INT, `y`: ARRAY<BOOLEAN>>,",
-        "`a` BIGINT NOT NULL)",
+        "b BIGINT,",
+        "c BIGINT,",
+        "extraCol ARRAY<INT>,",
+        "`<another>` STRUCT<x: INT, y: ARRAY<BOOLEAN>>,",
+        "a BIGINT NOT NULL)",
         "USING parquet",
         "OPTIONS (",
         "'from' = '0',",
@@ -85,11 +89,26 @@ trait ShowCreateTableSuiteBase extends command.ShowCreateTableSuiteBase
       sql(
         s"""CREATE TABLE $t
            |USING json
+           |CLUSTERED BY (a) INTO 2 BUCKETS
+           |AS SELECT 1 AS a, "foo" AS b
+         """.stripMargin
+      )
+      val expected = s"CREATE TABLE $fullName ( a INT, b STRING) USING json" +
+        s" CLUSTERED BY (a) INTO 2 BUCKETS"
+      assert(getShowCreateDDL(t).mkString(" ") == expected)
+    }
+  }
+
+  test("sort bucketed data source table") {
+    withNamespaceAndTable(ns, table) { t =>
+      sql(
+        s"""CREATE TABLE $t
+           |USING json
            |CLUSTERED BY (a) SORTED BY (b) INTO 2 BUCKETS
            |AS SELECT 1 AS a, "foo" AS b
          """.stripMargin
       )
-      val expected = s"CREATE TABLE $fullName ( `a` INT, `b` STRING) USING json" +
+      val expected = s"CREATE TABLE $fullName ( a INT, b STRING) USING json" +
         s" CLUSTERED BY (a) SORTED BY (b) INTO 2 BUCKETS"
       assert(getShowCreateDDL(t).mkString(" ") == expected)
     }
@@ -101,11 +120,27 @@ trait ShowCreateTableSuiteBase extends command.ShowCreateTableSuiteBase
         s"""CREATE TABLE $t
            |USING json
            |PARTITIONED BY (c)
+           |CLUSTERED BY (a) INTO 2 BUCKETS
+           |AS SELECT 1 AS a, "foo" AS b, 2.5 AS c
+         """.stripMargin
+      )
+      val expected = s"CREATE TABLE $fullName ( a INT, b STRING, c DECIMAL(2,1)) USING json" +
+        s" PARTITIONED BY (c) CLUSTERED BY (a) INTO 2 BUCKETS"
+      assert(getShowCreateDDL(t).mkString(" ") == expected)
+    }
+  }
+
+  test("partitioned sort bucketed data source table") {
+    withNamespaceAndTable(ns, table) { t =>
+      sql(
+        s"""CREATE TABLE $t
+           |USING json
+           |PARTITIONED BY (c)
            |CLUSTERED BY (a) SORTED BY (b) INTO 2 BUCKETS
            |AS SELECT 1 AS a, "foo" AS b, 2.5 AS c
          """.stripMargin
       )
-      val expected = s"CREATE TABLE $fullName ( `a` INT, `b` STRING, `c` DECIMAL(2,1)) USING json" +
+      val expected = s"CREATE TABLE $fullName ( a INT, b STRING, c DECIMAL(2,1)) USING json" +
         s" PARTITIONED BY (c) CLUSTERED BY (a) SORTED BY (b) INTO 2 BUCKETS"
       assert(getShowCreateDDL(t).mkString(" ") == expected)
     }
@@ -123,11 +158,37 @@ trait ShowCreateTableSuiteBase extends command.ShowCreateTableSuiteBase
          """.stripMargin
       )
 
-      val cause = intercept[AnalysisException] {
-        getShowCreateDDL(t, true)
-      }
+      checkError(
+        exception = intercept[AnalysisException] {
+          getShowCreateDDL(t, true)
+        },
+        errorClass = "_LEGACY_ERROR_TEMP_1274",
+        parameters = Map("table" -> "`spark_catalog`.`ns1`.`tbl`")
+      )
+    }
+  }
 
-      assert(cause.getMessage.contains("Use `SHOW CREATE TABLE` without `AS SERDE` instead"))
+  test("show create table with default column values") {
+    withNamespaceAndTable(ns, table) { t =>
+      sql(
+        s"""
+           |CREATE TABLE $t (
+           |  a bigint NOT NULL,
+           |  b bigint DEFAULT 42,
+           |  c string DEFAULT 'abc, "def"' COMMENT 'comment'
+           |)
+           |USING parquet
+           |COMMENT 'This is a comment'
+        """.stripMargin)
+      val showDDL = getShowCreateDDL(t)
+      assert(showDDL === Array(
+        s"CREATE TABLE $fullName (",
+        "a BIGINT,",
+        "b BIGINT DEFAULT 42,",
+        "c STRING DEFAULT 'abc, \"def\"' COMMENT 'comment')",
+        "USING parquet",
+        "COMMENT 'This is a comment'"
+      ))
     }
   }
 }

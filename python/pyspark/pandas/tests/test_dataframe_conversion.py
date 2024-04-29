@@ -20,20 +20,22 @@ import shutil
 import string
 import tempfile
 import unittest
+import sys
+from distutils.version import LooseVersion
 
 import numpy as np
 import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.testing.pandasutils import PandasOnSparkTestCase, TestUtils
+from pyspark.testing.pandasutils import ComparisonTestBase, TestUtils
 from pyspark.testing.sqlutils import SQLTestUtils
 
 
-class DataFrameConversionTest(PandasOnSparkTestCase, SQLTestUtils, TestUtils):
+class DataFrameConversionTestsMixin:
     """Test cases for "small data" conversion and I/O."""
 
     def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp(prefix=DataFrameConversionTest.__name__)
+        self.tmp_dir = tempfile.mkdtemp(prefix=DataFrameConversionTests.__name__)
 
     def tearDown(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
@@ -41,10 +43,6 @@ class DataFrameConversionTest(PandasOnSparkTestCase, SQLTestUtils, TestUtils):
     @property
     def pdf(self):
         return pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}, index=[0, 1, 3])
-
-    @property
-    def psdf(self):
-        return ps.from_pandas(self.pdf)
 
     @staticmethod
     def strip_all_whitespace(str):
@@ -93,7 +91,6 @@ class DataFrameConversionTest(PandasOnSparkTestCase, SQLTestUtils, TestUtils):
             "expected": pd.read_excel(pandas_location, index_col=0),
         }
 
-    @unittest.skip("openpyxl")
     def test_to_excel(self):
         with self.temp_dir() as dirpath:
             pandas_location = dirpath + "/" + "output1.xlsx"
@@ -191,7 +188,10 @@ class DataFrameConversionTest(PandasOnSparkTestCase, SQLTestUtils, TestUtils):
             output_path = "%s/%s/%s" % (self.tmp_dir, partition_path, output_paths[0])
             self.assertEqual("[%s]" % open(output_path).read().strip(), expected)
 
-    @unittest.skip("Pyperclip could not find a copy/paste mechanism for Linux.")
+    @unittest.skipIf(
+        sys.platform == "linux" or sys.platform == "linux2",
+        "Pyperclip could not find a copy/paste mechanism for Linux.",
+    )
     def test_to_clipboard(self):
         pdf = self.pdf
         psdf = self.psdf
@@ -202,6 +202,10 @@ class DataFrameConversionTest(PandasOnSparkTestCase, SQLTestUtils, TestUtils):
             psdf.to_clipboard(sep=";", index=False), pdf.to_clipboard(sep=";", index=False)
         )
 
+    @unittest.skipIf(
+        LooseVersion(pd.__version__) >= LooseVersion("2.0.0"),
+        "TODO(SPARK-43561): Enable DataFrameConversionTests.test_to_latex for pandas 2.0.0.",
+    )
     def test_to_latex(self):
         pdf = self.pdf
         psdf = self.psdf
@@ -259,11 +263,17 @@ class DataFrameConversionTest(PandasOnSparkTestCase, SQLTestUtils, TestUtils):
         )
 
 
+class DataFrameConversionTests(
+    DataFrameConversionTestsMixin, ComparisonTestBase, SQLTestUtils, TestUtils
+):
+    pass
+
+
 if __name__ == "__main__":
     from pyspark.pandas.tests.test_dataframe_conversion import *  # noqa: F401
 
     try:
-        import xmlrunner  # type: ignore[import]
+        import xmlrunner
 
         testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
     except ImportError:

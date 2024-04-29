@@ -24,12 +24,15 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.text.SimpleDateFormat
 import java.util.{Date, Locale, TimeZone}
 import javax.servlet.http.HttpServletRequest
-import javax.ws.rs.core.{MediaType, Response}
+import javax.ws.rs.core.{MediaType, MultivaluedMap, Response}
 
 import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 import scala.xml._
 import scala.xml.transform.{RewriteRule, RuleTransformer}
+
+import org.apache.commons.text.StringEscapeUtils
+import org.glassfish.jersey.internal.util.collection.MultivaluedStringMap
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.ui.scope.RDDOperationGraph
@@ -139,7 +142,7 @@ private[spark] object UIUtils extends Logging {
    *
    * @param batchTime the batch time to be formatted
    * @param batchInterval the batch interval
-   * @param showYYYYMMSS if showing the `yyyy/MM/dd` part. If it's false, the return value wll be
+   * @param showYYYYMMSS if showing the `yyyy/MM/dd` part. If it's false, the return value will be
    *                     only `HH:mm:ss` or `HH:mm:ss.SSS` depending on `batchInterval`
    * @param timezone only for test
    */
@@ -252,20 +255,15 @@ private[spark] object UIUtils extends Logging {
   }
 
   def dataTablesHeaderNodes(request: HttpServletRequest): Seq[Node] = {
-    <link rel="stylesheet" href={prependBaseUri(request,
-      "/static/jquery.dataTables.1.10.20.min.css")} type="text/css"/>
     <link rel="stylesheet"
-          href={prependBaseUri(request, "/static/dataTables.bootstrap4.1.10.20.min.css")}
+          href={prependBaseUri(request, "/static/dataTables.bootstrap4.1.13.5.min.css")}
           type="text/css"/>
     <link rel="stylesheet"
-          href={prependBaseUri(request, "/static/jsonFormatter.min.css")} type="text/css"/>
-    <link rel="stylesheet"
           href={prependBaseUri(request, "/static/webui-dataTables.css")} type="text/css"/>
-    <script src={prependBaseUri(request, "/static/jquery.dataTables.1.10.20.min.js")}></script>
+    <script src={prependBaseUri(request, "/static/jquery.dataTables.1.13.5.min.js")}></script>
     <script src={prependBaseUri(request, "/static/jquery.cookies.2.2.0.min.js")}></script>
     <script src={prependBaseUri(request, "/static/jquery.blockUI.min.js")}></script>
-    <script src={prependBaseUri(request, "/static/dataTables.bootstrap4.1.10.20.min.js")}></script>
-    <script src={prependBaseUri(request, "/static/jsonFormatter.min.js")}></script>
+    <script src={prependBaseUri(request, "/static/dataTables.bootstrap4.1.13.5.min.js")}></script>
     <script src={prependBaseUri(request, "/static/jquery.mustache.js")}></script>
   }
 
@@ -490,7 +488,8 @@ private[spark] object UIUtils extends Logging {
   }
 
   /** Return a "DAG visualization" DOM element that expands into a visualization for a job. */
-  def showDagVizForJob(jobId: Int, graphs: Seq[RDDOperationGraph]): Seq[Node] = {
+  def showDagVizForJob(jobId: Int,
+      graphs: collection.Seq[RDDOperationGraph]): collection.Seq[Node] = {
     showDagViz(graphs, forJob = true)
   }
 
@@ -501,7 +500,8 @@ private[spark] object UIUtils extends Logging {
    * a format that is expected by spark-dag-viz.js. Any changes in the format here must be
    * reflected there.
    */
-  private def showDagViz(graphs: Seq[RDDOperationGraph], forJob: Boolean): Seq[Node] = {
+  private def showDagViz(
+      graphs: collection.Seq[RDDOperationGraph], forJob: Boolean): collection.Seq[Node] = {
     <div>
       <span id={if (forJob) "job-dag-viz" else "stage-dag-viz"}
             class="expand-dag-viz" onclick={s"toggleDagViz($forJob);"}>
@@ -551,8 +551,8 @@ private[spark] object UIUtils extends Logging {
    * the whole string will rendered as a simple escaped text.
    *
    * Note: In terms of security, only anchor tags with root relative links are supported. So any
-   * attempts to embed links outside Spark UI, or other tags like &lt;script&gt; will cause in
-   * the whole description to be treated as plain text.
+   * attempts to embed links outside Spark UI, other tags like &lt;script&gt;, or inline scripts
+   * like `onclick` will cause in the whole description to be treated as plain text.
    *
    * @param desc        the original job or stage description string, which may contain html tags.
    * @param basePathUri with which to prepend the relative links; this is used when plainText is
@@ -572,7 +572,13 @@ private[spark] object UIUtils extends Logging {
 
       // Verify that this has only anchors and span (we are wrapping in span)
       val allowedNodeLabels = Set("a", "span", "br")
-      val illegalNodes = (xml \\ "_").filterNot(node => allowedNodeLabels.contains(node.label))
+      val allowedAttributes = Set("class", "href")
+      val illegalNodes =
+        (xml \\ "_").filterNot { node =>
+          allowedNodeLabels.contains(node.label) &&
+            // Verify we only have href attributes
+            node.attributes.map(_.key).forall(allowedAttributes.contains)
+        }
       if (illegalNodes.nonEmpty) {
         throw new IllegalArgumentException(
           "Only HTML anchors allowed in job descriptions\n" +
@@ -636,6 +642,22 @@ private[spark] object UIUtils extends Logging {
     param
   }
 
+  /**
+   * Decode URLParameter if URL is encoded by YARN-WebAppProxyServlet.
+   */
+  def decodeURLParameter(params: MultivaluedMap[String, String]): MultivaluedStringMap = {
+    val decodedParameters = new MultivaluedStringMap
+    params.forEach((encodeKey, encodeValues) => {
+      val decodeKey = decodeURLParameter(encodeKey)
+      val decodeValues = new java.util.LinkedList[String]
+      encodeValues.forEach(v => {
+        decodeValues.add(decodeURLParameter(v))
+      })
+      decodedParameters.addAll(decodeKey, decodeValues)
+    })
+    decodedParameters
+  }
+
   def getTimeZoneOffset() : Int =
     TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000 / 60
 
@@ -689,5 +711,32 @@ private[spark] object UIUtils extends Logging {
     } else {
       Seq.empty[Node]
     }
+  }
+
+  private final val ERROR_CLASS_REGEX = """\[(?<errorClass>[A-Z][A-Z_.]+[A-Z])]""".r
+
+  private def errorSummary(errorMessage: String): (String, Boolean) = {
+    var isMultiline = true
+    val maybeErrorClass =
+      ERROR_CLASS_REGEX.findFirstMatchIn(errorMessage).map(_.group("errorClass"))
+    val errorClassOrBrief = if (maybeErrorClass.nonEmpty && maybeErrorClass.get.nonEmpty) {
+      maybeErrorClass.get
+    } else if (errorMessage.indexOf('\n') >= 0) {
+      errorMessage.substring(0, errorMessage.indexOf('\n'))
+    } else if (errorMessage.indexOf(":") >= 0) {
+      errorMessage.substring(0, errorMessage.indexOf(":"))
+    } else {
+      isMultiline = false
+      errorMessage
+    }
+
+    val errorSummary = StringEscapeUtils.escapeHtml4(errorClassOrBrief)
+    (errorSummary, isMultiline)
+  }
+
+  def errorMessageCell(errorMessage: String): Seq[Node] = {
+    val (summary, isMultiline) = errorSummary(errorMessage)
+    val details = detailsUINode(isMultiline, errorMessage)
+    <td>{summary}{details}</td>
   }
 }

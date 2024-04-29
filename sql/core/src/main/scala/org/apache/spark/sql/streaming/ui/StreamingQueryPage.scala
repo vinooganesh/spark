@@ -174,7 +174,7 @@ private[ui] class StreamingQueryPagedTable(
 
   override def row(query: StructuredStreamingRow): Seq[Node] = {
     val streamingQuery = query.streamingUIData
-    val statisticsLink = "%s/%s/statistics?id=%s"
+    val statisticsLink = "%s/%s/statistics/?id=%s"
       .format(SparkUIUtils.prependBaseUri(request, parent.basePath), parent.prefix,
         streamingQuery.summary.runId)
 
@@ -198,8 +198,8 @@ private[ui] class StreamingQueryPagedTable(
       <td><a href={statisticsLink}>{streamingQuery.summary.runId}</a></td>
       <td>{SparkUIUtils.formatDate(streamingQuery.summary.startTimestamp)}</td>
       <td>{SparkUIUtils.formatDurationVerbose(query.duration)}</td>
-      <td>{withNoProgress(streamingQuery, {query.avgInput.formatted("%.2f")}, "NaN")}</td>
-      <td>{withNoProgress(streamingQuery, {query.avgProcess.formatted("%.2f")}, "NaN")}</td>
+      <td>{withNoProgress(streamingQuery, {"%.2f".format(query.avgInput)}, "NaN")}</td>
+      <td>{withNoProgress(streamingQuery, {"%.2f".format(query.avgProcess)}, "NaN")}</td>
       <td>{withNoProgress(streamingQuery, {streamingQuery.lastProgress.batchId}, "NaN")}</td>
       {details(streamingQuery.summary.exception.getOrElse("-"))}
     </tr>

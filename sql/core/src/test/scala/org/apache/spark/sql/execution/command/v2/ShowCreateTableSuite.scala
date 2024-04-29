@@ -51,8 +51,8 @@ class ShowCreateTableSuite extends command.ShowCreateTableSuiteBase with Command
       val showDDL = getShowCreateDDL(t, false)
       assert(showDDL === Array(
         s"CREATE TABLE $t (",
-        "`a` INT,",
-        "`b` STRING)",
+        "a INT,",
+        "b STRING)",
         defaultUsing,
         "PARTITIONED BY (a)",
         "COMMENT 'This is a comment'",
@@ -82,18 +82,23 @@ class ShowCreateTableSuite extends command.ShowCreateTableSuiteBase with Command
            |  to = 1,
            |  via = 2)
            |COMMENT 'This is a comment'
-           |TBLPROPERTIES ('prop1' = '1', 'prop2' = '2', 'prop3' = 3, 'prop4' = 4)
+           |TBLPROPERTIES (
+           |  'prop1' = '1',
+           |  'prop2' = '2',
+           |  'prop3' = 3,
+           |  'prop4' = 4,
+           |  'password' = 'password')
            |PARTITIONED BY (a)
            |LOCATION '/tmp'
         """.stripMargin)
       val showDDL = getShowCreateDDL(t, false)
       assert(showDDL === Array(
         s"CREATE TABLE $t (",
-        "`a` BIGINT NOT NULL,",
-        "`b` BIGINT,",
-        "`c` BIGINT,",
-        "`extraCol` ARRAY<INT>,",
-        "`<another>` STRUCT<`x`: INT, `y`: ARRAY<BOOLEAN>>)",
+        "a BIGINT NOT NULL,",
+        "b BIGINT,",
+        "c BIGINT,",
+        "extraCol ARRAY<INT>,",
+        "`<another>` STRUCT<x: INT, y: ARRAY<BOOLEAN>>)",
         defaultUsing,
         "OPTIONS (",
         "'from' = '0',",
@@ -103,6 +108,7 @@ class ShowCreateTableSuite extends command.ShowCreateTableSuiteBase with Command
         "COMMENT 'This is a comment'",
         "LOCATION 'file:/tmp'",
         "TBLPROPERTIES (",
+        "'password' = '*********(redacted)',",
         "'prop1' = '1',",
         "'prop2' = '2',",
         "'prop3' = '3',",
@@ -128,12 +134,30 @@ class ShowCreateTableSuite extends command.ShowCreateTableSuiteBase with Command
       val showDDL = getShowCreateDDL(t, false)
       assert(showDDL === Array(
         s"CREATE TABLE $t (",
-        "`a` INT,",
-        "`b` STRING,",
-        "`ts` TIMESTAMP)",
+        "a INT,",
+        "b STRING,",
+        "ts TIMESTAMP)",
         defaultUsing,
-        "PARTITIONED BY (a, bucket(16, b), years(ts), months(ts), days(ts), hours(ts))"
+        "PARTITIONED BY (a, years(ts), months(ts), days(ts), hours(ts))",
+        "CLUSTERED BY (b)",
+        "INTO 16 BUCKETS"
       ))
+    }
+  }
+
+  test("should quote identifiers with special characters") {
+    withNamespaceAndTable("`a_schema-with+special^chars`", "`a_table-with+special^chars`") { t =>
+      sql(s"""
+           |CREATE TABLE $t (
+           |  a bigint NOT NULL,
+           |  b bigint
+           |) $defaultUsing
+        """.stripMargin)
+      val showDDL = getShowCreateDDL(t)
+      assert(
+        showDDL(0) == s"CREATE TABLE test_catalog.`a_schema-with+special^chars`." +
+        s"`a_table-with+special^chars` ("
+      )
     }
   }
 }

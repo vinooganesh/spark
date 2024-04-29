@@ -33,7 +33,9 @@ import org.apache.parquet.hadoop.metadata.{BlockMetaData, FileMetaData, ParquetM
 import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.parquet.schema.MessageType
 
+import org.apache.spark.TestUtils
 import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.catalyst.ScalaReflection
 import org.apache.spark.sql.execution.datasources.FileBasedDataSourceTest
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StructType
@@ -50,6 +52,8 @@ private[sql] trait ParquetTest extends FileBasedDataSourceTest {
   override protected val dataSourceName: String = "parquet"
   override protected val vectorizedReaderEnabledKey: String =
     SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key
+  override protected val vectorizedReaderNestedEnabledKey: String =
+    SQLConf.PARQUET_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key
 
   /**
    * Reads the parquet file at `path`
@@ -162,11 +166,21 @@ private[sql] trait ParquetTest extends FileBasedDataSourceTest {
     Thread.currentThread().getContextClassLoader.getResource(name).toString
   }
 
+  protected def schemaFor[T: TypeTag]: StructType = ScalaReflection.encoderFor[T].schema
+
   def withAllParquetReaders(code: => Unit): Unit = {
     // test the row-based reader
-    withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "false")(code)
+    withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "false") {
+      withClue("Parquet-mr reader") {
+        code
+      }
+    }
     // test the vectorized reader
-    withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "true")(code)
+    withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "true") {
+      withClue("Vectorized reader") {
+        code
+      }
+    }
   }
 
   def withAllParquetWriters(code: => Unit): Unit = {
@@ -179,7 +193,7 @@ private[sql] trait ParquetTest extends FileBasedDataSourceTest {
   }
 
   def getMetaData(dir: java.io.File): Map[String, String] = {
-    val file = SpecificParquetRecordReaderBase.listDirectory(dir).get(0)
+    val file = TestUtils.listDirectory(dir).head
     val conf = new Configuration()
     val hadoopInputFile = HadoopInputFile.fromPath(new Path(file), conf)
     val parquetReadOptions = HadoopReadOptions.builder(conf).build()

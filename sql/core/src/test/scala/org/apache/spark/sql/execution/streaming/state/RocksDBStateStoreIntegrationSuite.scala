@@ -27,10 +27,11 @@ import org.apache.spark.sql.execution.streaming.{MemoryStream, StreamingQueryWra
 import org.apache.spark.sql.functions.count
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming._
-import org.apache.spark.tags.ExtendedRocksDBTest
+import org.apache.spark.sql.streaming.OutputMode.Update
+import org.apache.spark.util.Utils
 
-@ExtendedRocksDBTest
-class RocksDBStateStoreIntegrationSuite extends StreamTest {
+class RocksDBStateStoreIntegrationSuite extends StreamTest
+  with AlsoTestWithChangelogCheckpointingEnabled {
   import testImplicits._
 
   test("RocksDBStateStore") {
@@ -47,7 +48,11 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
           // Verify that RocksDBStateStore by verify the state checkpoints are [version].zip
           val storeCheckpointDir = StateStoreId(
             dir.getAbsolutePath + "/state", 0, 0).storeCheckpointLocation()
-          val storeCheckpointFile = storeCheckpointDir + "/1.zip"
+          val storeCheckpointFile = if (isChangelogCheckpointingEnabled) {
+            storeCheckpointDir + "/1.changelog"
+          } else {
+            storeCheckpointDir + "/1.zip"
+          }
           new File(storeCheckpointFile).exists()
         }
       )
@@ -67,7 +72,7 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
         val inputData = MemoryStream[Int]
 
         val query = inputData.toDS().toDF("value")
-          .select('value)
+          .select($"value")
           .groupBy($"value")
           .agg(count("*"))
           .writeStream
@@ -97,7 +102,8 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
               "rocksdbReadBlockCacheHitCount", "rocksdbReadBlockCacheMissCount",
               "rocksdbTotalBytesReadByCompaction", "rocksdbTotalBytesWrittenByCompaction",
               "rocksdbTotalCompactionLatencyMs", "rocksdbWriterStallLatencyMs",
-              "rocksdbTotalBytesReadThroughIterator"))
+              "rocksdbTotalBytesReadThroughIterator", "rocksdbTotalBytesWrittenByFlush",
+              "rocksdbPinnedBlocksMemoryUsage"))
           }
         } finally {
           query.stop()
@@ -109,7 +115,7 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
   testQuietly("SPARK-36519: store RocksDB format version in the checkpoint") {
     def getFormatVersion(query: StreamingQuery): Int = {
       query.asInstanceOf[StreamingQueryWrapper].streamingQuery.lastExecution.sparkSession
-        .sessionState.conf.getConf(SQLConf.STATE_STORE_ROCKSDB_FORMAT_VERSION)
+        .conf.get(SQLConf.STATE_STORE_ROCKSDB_FORMAT_VERSION)
     }
 
     withSQLConf(
@@ -119,7 +125,7 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
 
         def startQuery(): StreamingQuery = {
           inputData.toDS().toDF("value")
-            .select('value)
+            .select($"value")
             .groupBy($"value")
             .agg(count("*"))
             .writeStream
@@ -156,7 +162,7 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
       SQLConf.STATE_STORE_ROCKSDB_FORMAT_VERSION.key -> "100") {
       val inputData = MemoryStream[Int]
       val query = inputData.toDS().toDF("value")
-        .select('value)
+        .select($"value")
         .groupBy($"value")
         .agg(count("*"))
         .writeStream
@@ -165,7 +171,7 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
         .start()
       inputData.addData(1, 2)
       val e = intercept[StreamingQueryException](query.processAllAvailable())
-      assert(e.getCause.getCause.getMessage.contains("Unsupported BlockBasedTable format_version"))
+      assert(e.getCause.getMessage.contains("Unsupported BlockBasedTable format_version"))
     }
   }
 
@@ -175,11 +181,11 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
         (SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName),
         (SQLConf.CHECKPOINT_LOCATION.key -> dir.getCanonicalPath),
         (SQLConf.SHUFFLE_PARTITIONS.key, "1"),
-        (s"${RocksDBConf.ROCKSDB_CONF_NAME_PREFIX}.trackTotalNumberOfRows" -> "false")) {
+        (s"${RocksDBConf.ROCKSDB_SQL_CONF_NAME_PREFIX}.trackTotalNumberOfRows" -> "false")) {
         val inputData = MemoryStream[Int]
 
         val query = inputData.toDS().toDF("value")
-          .select('value)
+          .select($"value")
           .groupBy($"value")
           .agg(count("*"))
           .writeStream
@@ -205,5 +211,54 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
         }
       }
     }
+  }
+
+  testWithChangelogCheckpointingEnabled(
+    "Streaming aggregation RocksDB State Store backward compatibility.") {
+    val checkpointDir = Utils.createTempDir().getCanonicalFile
+    checkpointDir.delete()
+
+    val dirForPartition0 = new File(checkpointDir.getAbsolutePath, "/state/0/0")
+    val inputData = MemoryStream[Int]
+    val aggregated =
+      inputData.toDF()
+        .groupBy($"value")
+        .agg(count("*"))
+        .as[(Int, Long)]
+
+    // Run the stream with changelog checkpointing disabled.
+    testStream(aggregated, Update)(
+      StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
+        additionalConfs = Map(rocksdbChangelogCheckpointingConfKey -> "false")),
+      AddData(inputData, 3),
+      CheckLastBatch((3, 1)),
+      AddData(inputData, 3, 2),
+      CheckLastBatch((3, 2), (2, 1)),
+      StopStream
+    )
+    assert(changelogVersionsPresent(dirForPartition0).isEmpty)
+    assert(snapshotVersionsPresent(dirForPartition0) == List(1L, 2L))
+
+    // Run the stream with changelog checkpointing enabled.
+    testStream(aggregated, Update)(
+      StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
+        additionalConfs = Map(rocksdbChangelogCheckpointingConfKey -> "true")),
+      AddData(inputData, 3, 2, 1),
+      CheckLastBatch((3, 3), (2, 2), (1, 1)),
+      // By default we run in new tuple mode.
+      AddData(inputData, 4, 4, 4, 4),
+      CheckLastBatch((4, 4))
+    )
+    assert(changelogVersionsPresent(dirForPartition0) == List(3L, 4L))
+
+    // Run the stream with changelog checkpointing disabled.
+    testStream(aggregated, Update)(
+      StartStream(checkpointLocation = checkpointDir.getAbsolutePath,
+        additionalConfs = Map(rocksdbChangelogCheckpointingConfKey -> "false")),
+      AddData(inputData, 4),
+      CheckLastBatch((4, 5))
+    )
+    assert(changelogVersionsPresent(dirForPartition0) == List(3L, 4L))
+    assert(snapshotVersionsPresent(dirForPartition0).contains(5L))
   }
 }

@@ -18,7 +18,6 @@
 package org.apache.spark.sql.catalyst.expressions.codegen
 
 import java.io.ByteArrayInputStream
-import java.util.{Map => JavaMap}
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
@@ -26,10 +25,9 @@ import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.util.control.NonFatal
 
-import com.google.common.cache.{CacheBuilder, CacheLoader}
 import com.google.common.util.concurrent.{ExecutionError, UncheckedExecutionException}
-import org.codehaus.commons.compiler.CompileException
-import org.codehaus.janino.{ByteArrayClassLoader, ClassBodyEvaluator, InternalCompilerException, SimpleCompiler}
+import org.codehaus.commons.compiler.{CompileException, InternalCompilerException}
+import org.codehaus.janino.ClassBodyEvaluator
 import org.codehaus.janino.util.ClassFile
 
 import org.apache.spark.{TaskContext, TaskKilledException}
@@ -37,16 +35,18 @@ import org.apache.spark.executor.InputMetrics
 import org.apache.spark.internal.Logging
 import org.apache.spark.metrics.source.CodegenMetrics
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.encoders.HashableWeakReference
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
-import org.apache.spark.sql.catalyst.util.{ArrayData, MapData, SQLOrderingUtil}
+import org.apache.spark.sql.catalyst.types._
+import org.apache.spark.sql.catalyst.util.{ArrayData, MapData, SQLOrderingUtil, UnsafeRowUtils}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.unsafe.types._
-import org.apache.spark.util.{LongAccumulator, ParentClassLoader, Utils}
+import org.apache.spark.util.{LongAccumulator, NonFateSharingCache, ParentClassLoader, Utils}
 
 /**
  * Java source for evaluating an [[Expression]] given a [[InternalRow]] of input.
@@ -629,7 +629,7 @@ class CodegenContext extends Logging {
     case udt: UserDefinedType[_] => genEqual(udt.sqlType, c1, c2)
     case NullType => "false"
     case _ =>
-      throw QueryExecutionErrors.cannotGenerateCodeForUncomparableTypeError(
+      throw QueryExecutionErrors.cannotGenerateCodeForIncomparableTypeError(
         "equality", dataType)
   }
 
@@ -720,7 +720,7 @@ class CodegenContext extends Logging {
     case other if other.isInstanceOf[AtomicType] => s"$c1.compare($c2)"
     case udt: UserDefinedType[_] => genComp(udt.sqlType, c1, c2)
     case _ =>
-      throw QueryExecutionErrors.cannotGenerateCodeForUncomparableTypeError("compare", dataType)
+      throw QueryExecutionErrors.cannotGenerateCodeForIncomparableTypeError("compare", dataType)
   }
 
   /**
@@ -1195,10 +1195,13 @@ class CodegenContext extends Logging {
         }
         (localSubExprEliminationExprs, exprCodesNeedEvaluate)
       } else {
+        val errMsg = "Failed to split subexpression code into small functions because " +
+          "the parameter length of at least one split function went over the JVM limit: " +
+          MAX_JVM_METHOD_PARAMS_LENGTH
         if (Utils.isTesting) {
-          throw QueryExecutionErrors.failedSplitSubExpressionError(MAX_JVM_METHOD_PARAMS_LENGTH)
+          throw new IllegalStateException(errMsg)
         } else {
-          logInfo(QueryExecutionErrors.failedSplitSubExpressionMsg(MAX_JVM_METHOD_PARAMS_LENGTH))
+          logInfo(errMsg)
           (localSubExprEliminationExprsForNonSplit, Seq.empty)
         }
       }
@@ -1268,8 +1271,11 @@ class CodegenContext extends Logging {
   def generateExpressions(
       expressions: Seq[Expression],
       doSubexpressionElimination: Boolean = false): Seq[ExprCode] = {
-    if (doSubexpressionElimination) subexpressionElimination(expressions)
-    expressions.map(e => e.genCode(this))
+    // We need to make sure that we do not reuse stateful expressions. This is needed for codegen
+    // as well because some expressions may implement `CodegenFallback`.
+    val cleanedExpressions = expressions.map(_.freshCopyIfContainsStatefulExpression())
+    if (doSubexpressionElimination) subexpressionElimination(cleanedExpressions)
+    cleanedExpressions.map(e => e.genCode(this))
   }
 
   /**
@@ -1434,10 +1440,11 @@ object CodeGenerator extends Logging {
    * @return a pair of a generated class and the bytecode statistics of generated functions.
    */
   def compile(code: CodeAndComment): (GeneratedClass, ByteCodeStats) = try {
-    cache.get(code)
+    val classLoaderRef = new HashableWeakReference(Utils.getContextOrSparkClassLoader)
+    cache.get((classLoaderRef, code))
   } catch {
     // Cache.get() may wrap the original exception. See the following URL
-    // http://google.github.io/guava/releases/14.0/api/docs/com/google/common/cache/
+    // https://guava.dev/releases/14.0.1/api/docs/com/google/common/cache/
     //   Cache.html#get(K,%20java.util.concurrent.Callable)
     case e @ (_: UncheckedExecutionException | _: ExecutionError) =>
       throw e.getCause
@@ -1521,14 +1528,7 @@ object CodeGenerator extends Logging {
    */
   private def updateAndGetCompilationStats(evaluator: ClassBodyEvaluator): ByteCodeStats = {
     // First retrieve the generated classes.
-    val classes = {
-      val resultField = classOf[SimpleCompiler].getDeclaredField("result")
-      resultField.setAccessible(true)
-      val loader = resultField.get(evaluator).asInstanceOf[ByteArrayClassLoader]
-      val classesField = loader.getClass.getDeclaredField("classes")
-      classesField.setAccessible(true)
-      classesField.get(loader).asInstanceOf[JavaMap[String, Array[Byte]]].asScala
-    }
+    val classes = evaluator.getBytecodes.asScala
 
     // Then walk the classes to get at the method bytecode.
     val codeAttr = Utils.classForName("org.codehaus.janino.util.ClassFile$CodeAttribute")
@@ -1577,24 +1577,27 @@ object CodeGenerator extends Logging {
    * they are explicitly removed. A Cache on the other hand is generally configured to evict entries
    * automatically, in order to constrain its memory footprint.  Note that this cache does not use
    * weak keys/values and thus does not respond to memory pressure.
+   *
+   * Codegen can be slow. Use a non fate sharing cache in case a query gets canceled during codegen
+   * while other queries wait on the same code, so that those other queries don't get wrongly
+   * aborted. See [[NonFateSharingCache]] for more details.
    */
-  private val cache = CacheBuilder.newBuilder()
-    .maximumSize(SQLConf.get.codegenCacheMaxEntries)
-    .build(
-      new CacheLoader[CodeAndComment, (GeneratedClass, ByteCodeStats)]() {
-        override def load(code: CodeAndComment): (GeneratedClass, ByteCodeStats) = {
-          val startTime = System.nanoTime()
-          val result = doCompile(code)
-          val endTime = System.nanoTime()
-          val duration = endTime - startTime
-          val timeMs: Double = duration.toDouble / NANOS_PER_MILLIS
-          CodegenMetrics.METRIC_SOURCE_CODE_SIZE.update(code.body.length)
-          CodegenMetrics.METRIC_COMPILATION_TIME.update(timeMs.toLong)
-          logInfo(s"Code generated in $timeMs ms")
-          _compileTime.add(duration)
-          result
-        }
-      })
+  private val cache = {
+    val loadFunc: ((HashableWeakReference, CodeAndComment)) => (GeneratedClass, ByteCodeStats) = {
+      case (_, code) =>
+        val startTime = System.nanoTime()
+        val result = doCompile(code)
+        val endTime = System.nanoTime()
+        val duration = endTime - startTime
+        val timeMs: Double = duration.toDouble / NANOS_PER_MILLIS
+        CodegenMetrics.METRIC_SOURCE_CODE_SIZE.update(code.body.length)
+        CodegenMetrics.METRIC_COMPILATION_TIME.update(timeMs.toLong)
+        logInfo(s"Code generated in $timeMs ms")
+        _compileTime.add(duration)
+        result
+    }
+    NonFateSharingCache(loadFunc, SQLConf.get.codegenCacheMaxEntries)
+  }
 
   /**
    * Name of Java primitive data type
@@ -1627,17 +1630,19 @@ object CodeGenerator extends Logging {
   def getValue(input: String, dataType: DataType, ordinal: String): String = {
     val jt = javaType(dataType)
     dataType match {
-      case _ if isPrimitiveType(jt) => s"$input.get${primitiveTypeName(jt)}($ordinal)"
-      case t: DecimalType => s"$input.getDecimal($ordinal, ${t.precision}, ${t.scale})"
-      case StringType => s"$input.getUTF8String($ordinal)"
-      case BinaryType => s"$input.getBinary($ordinal)"
-      case CalendarIntervalType => s"$input.getInterval($ordinal)"
-      case t: StructType => s"$input.getStruct($ordinal, ${t.size})"
-      case _: ArrayType => s"$input.getArray($ordinal)"
-      case _: MapType => s"$input.getMap($ordinal)"
-      case NullType => "null"
       case udt: UserDefinedType[_] => getValue(input, udt.sqlType, ordinal)
-      case _ => s"($jt)$input.get($ordinal, null)"
+      case _ if isPrimitiveType(jt) => s"$input.get${primitiveTypeName(jt)}($ordinal)"
+      case _ => PhysicalDataType(dataType) match {
+        case _: PhysicalArrayType => s"$input.getArray($ordinal)"
+        case PhysicalBinaryType => s"$input.getBinary($ordinal)"
+        case PhysicalCalendarIntervalType => s"$input.getInterval($ordinal)"
+        case t: PhysicalDecimalType => s"$input.getDecimal($ordinal, ${t.precision}, ${t.scale})"
+        case _: PhysicalMapType => s"$input.getMap($ordinal)"
+        case PhysicalNullType => "null"
+        case PhysicalStringType => s"$input.getUTF8String($ordinal)"
+        case t: PhysicalStructType => s"$input.getStruct($ordinal, ${t.fields.size})"
+        case _ => s"($jt)$input.get($ordinal, null)"
+      }
     }
   }
 
@@ -1728,8 +1733,7 @@ object CodeGenerator extends Logging {
     if (nullable) {
       // Can't call setNullAt on DecimalType/CalendarIntervalType, because we need to keep the
       // offset
-      if (!isVectorized && (dataType.isInstanceOf[DecimalType] ||
-        dataType.isInstanceOf[CalendarIntervalType])) {
+      if (!isVectorized && UnsafeRowUtils.avoidSetNullAt(dataType)) {
         s"""
            |if (!${ev.isNull}) {
            |  ${setColumn(row, dataType, ordinal, ev.value)};
@@ -1822,12 +1826,17 @@ object CodeGenerator extends Logging {
    * Returns the specialized code to access a value from a column vector for a given `DataType`.
    */
   def getValueFromVector(vector: String, dataType: DataType, rowId: String): String = {
-    if (dataType.isInstanceOf[StructType]) {
+    val sqlDataType = dataType match {
+      case udt: UserDefinedType[_] => udt.sqlType
+      case _ => dataType
+    }
+
+    if (sqlDataType.isInstanceOf[StructType]) {
       // `ColumnVector.getStruct` is different from `InternalRow.getStruct`, it only takes an
       // `ordinal` parameter.
       s"$vector.getStruct($rowId)"
     } else {
-      getValue(vector, dataType, rowId)
+      getValue(vector, sqlDataType, rowId)
     }
   }
 
@@ -1901,24 +1910,26 @@ object CodeGenerator extends Logging {
    * Returns the Java type for a DataType.
    */
   def javaType(dt: DataType): String = dt match {
-    case BooleanType => JAVA_BOOLEAN
-    case ByteType => JAVA_BYTE
-    case ShortType => JAVA_SHORT
-    case IntegerType | DateType | _: YearMonthIntervalType => JAVA_INT
-    case LongType | TimestampType | TimestampNTZType | _: DayTimeIntervalType => JAVA_LONG
-    case FloatType => JAVA_FLOAT
-    case DoubleType => JAVA_DOUBLE
-    case _: DecimalType => "Decimal"
-    case BinaryType => "byte[]"
-    case StringType => "UTF8String"
-    case CalendarIntervalType => "CalendarInterval"
-    case _: StructType => "InternalRow"
-    case _: ArrayType => "ArrayData"
-    case _: MapType => "MapData"
     case udt: UserDefinedType[_] => javaType(udt.sqlType)
     case ObjectType(cls) if cls.isArray => s"${javaType(ObjectType(cls.getComponentType))}[]"
     case ObjectType(cls) => cls.getName
-    case _ => "Object"
+    case _ => PhysicalDataType(dt) match {
+      case _: PhysicalArrayType => "ArrayData"
+      case PhysicalBinaryType => "byte[]"
+      case PhysicalBooleanType => JAVA_BOOLEAN
+      case PhysicalByteType => JAVA_BYTE
+      case PhysicalCalendarIntervalType => "CalendarInterval"
+      case PhysicalIntegerType => JAVA_INT
+      case _: PhysicalDecimalType => "Decimal"
+      case PhysicalDoubleType => JAVA_DOUBLE
+      case PhysicalFloatType => JAVA_FLOAT
+      case PhysicalLongType => JAVA_LONG
+      case _: PhysicalMapType => "MapData"
+      case PhysicalShortType => JAVA_SHORT
+      case PhysicalStringType => "UTF8String"
+      case _: PhysicalStructType => "InternalRow"
+      case _ => "Object"
+    }
   }
 
   @tailrec

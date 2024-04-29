@@ -44,8 +44,15 @@ object GenerateMIMAIgnore {
   private def isPackagePrivate(sym: unv.Symbol) =
     !sym.privateWithin.fullName.startsWith("<none>")
 
-  private def isPackagePrivateModule(moduleSymbol: unv.ModuleSymbol) =
+  private def isPackagePrivateModule(moduleSymbol: unv.ModuleSymbol) = try {
     !moduleSymbol.privateWithin.fullName.startsWith("<none>")
+  } catch {
+    case e: Throwable =>
+      // scalastyle:off println
+      println("[WARN] Unable to check module:" + moduleSymbol)
+      // scalastyle:on println
+      false
+  }
 
   /**
    * For every class checks via scala reflection if the class itself or contained members
@@ -65,11 +72,12 @@ object GenerateMIMAIgnore {
         val directlyPrivateSpark =
           isPackagePrivate(classSymbol) ||
           isPackagePrivateModule(moduleSymbol) ||
-          classSymbol.isPrivate
+          classSymbol.isPrivate ||
+          moduleSymbol.isPrivate
         /* Inner classes defined within a private[spark] class or object are effectively
          invisible, so we account for them as package private. */
         lazy val indirectlyPrivateSpark = {
-          val maybeOuter = className.toString.takeWhile(_ != '$')
+          val maybeOuter = className.takeWhile(_ != '$')
           if (maybeOuter != className) {
             isPackagePrivate(mirror.classSymbol(Class.forName(maybeOuter, false, classLoader))) ||
               isPackagePrivateModule(mirror.staticModule(maybeOuter))

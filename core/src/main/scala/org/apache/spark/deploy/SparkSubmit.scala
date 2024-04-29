@@ -20,6 +20,7 @@ package org.apache.spark.deploy
 import java.io._
 import java.lang.reflect.{InvocationTargetException, UndeclaredThrowableException}
 import java.net.{URI, URL}
+import java.nio.file.Files
 import java.security.PrivilegedExceptionAction
 import java.text.ParseException
 import java.util.{ServiceLoader, UUID}
@@ -40,7 +41,7 @@ import org.apache.ivy.Ivy
 import org.apache.ivy.core.LogOptions
 import org.apache.ivy.core.module.descriptor._
 import org.apache.ivy.core.module.id.{ArtifactId, ModuleId, ModuleRevisionId}
-import org.apache.ivy.core.report.ResolveReport
+import org.apache.ivy.core.report.{DownloadStatus, ResolveReport}
 import org.apache.ivy.core.resolve.ResolveOptions
 import org.apache.ivy.core.retrieve.RetrieveOptions
 import org.apache.ivy.core.settings.IvySettings
@@ -157,24 +158,37 @@ private[spark] class SparkSubmit extends Logging {
 
     def doRunMain(): Unit = {
       if (args.proxyUser != null) {
-        val proxyUser = UserGroupInformation.createProxyUser(args.proxyUser,
-          UserGroupInformation.getCurrentUser())
-        try {
-          proxyUser.doAs(new PrivilegedExceptionAction[Unit]() {
-            override def run(): Unit = {
-              runMain(args, uninitLog)
-            }
-          })
-        } catch {
-          case e: Exception =>
-            // Hadoop's AuthorizationException suppresses the exception's stack trace, which
-            // makes the message printed to the output by the JVM not very helpful. Instead,
-            // detect exceptions with empty stack traces here, and treat them differently.
-            if (e.getStackTrace().length == 0) {
-              error(s"ERROR: ${e.getClass().getName()}: ${e.getMessage()}")
-            } else {
-              throw e
-            }
+        // Here we are checking for client mode because when job is sumbitted in cluster
+        // deploy mode with k8s resource manager, the spark submit in the driver container
+        // is done in client mode.
+        val isKubernetesClusterModeDriver = args.master.startsWith("k8s") &&
+          "client".equals(args.deployMode) &&
+          args.toSparkConf().getBoolean("spark.kubernetes.submitInDriver", false)
+        if (isKubernetesClusterModeDriver) {
+          logInfo("Running driver with proxy user. Cluster manager: Kubernetes")
+          SparkHadoopUtil.get.runAsSparkUser(() => runMain(args, uninitLog))
+        } else {
+          val proxyUser = UserGroupInformation.createProxyUser(args.proxyUser,
+            UserGroupInformation.getCurrentUser())
+          try {
+            proxyUser.doAs(new PrivilegedExceptionAction[Unit]() {
+              override def run(): Unit = {
+                runMain(args, uninitLog)
+              }
+            })
+          } catch {
+            case e: Exception =>
+              // Hadoop's AuthorizationException suppresses the exception's stack trace, which
+              // makes the message printed to the output by the JVM not very helpful. Instead,
+              // detect exceptions with empty stack traces here, and treat them differently.
+              if (e.getStackTrace().length == 0) {
+                error(s"ERROR: ${e.getClass().getName()}: ${e.getMessage()}")
+              } else {
+                throw e
+              }
+          } finally {
+            FileSystem.closeAllForUGI(proxyUser)
+          }
         }
       } else {
         runMain(args, uninitLog)
@@ -225,18 +239,24 @@ private[spark] class SparkSubmit extends Logging {
     val childArgs = new ArrayBuffer[String]()
     val childClasspath = new ArrayBuffer[String]()
     val sparkConf = args.toSparkConf()
+    if (sparkConf.contains("spark.local.connect")) sparkConf.remove("spark.remote")
     var childMainClass = ""
 
     // Set the cluster manager
-    val clusterManager: Int = args.master match {
-      case "yarn" => YARN
-      case m if m.startsWith("spark") => STANDALONE
-      case m if m.startsWith("mesos") => MESOS
-      case m if m.startsWith("k8s") => KUBERNETES
-      case m if m.startsWith("local") => LOCAL
-      case _ =>
-        error("Master must either be yarn or start with spark, mesos, k8s, or local")
-        -1
+    val clusterManager: Int = args.maybeMaster match {
+      case Some(v) =>
+        assert(args.maybeRemote.isEmpty || sparkConf.contains("spark.local.connect"))
+        v match {
+          case "yarn" => YARN
+          case m if m.startsWith("spark") => STANDALONE
+          case m if m.startsWith("mesos") => MESOS
+          case m if m.startsWith("k8s") => KUBERNETES
+          case m if m.startsWith("local") => LOCAL
+          case _ =>
+            error("Master must either be yarn or start with spark, mesos, k8s, or local")
+            -1
+        }
+      case None => LOCAL // default master or remote mode.
     }
 
     // Set the deploy mode; default is client mode
@@ -258,7 +278,7 @@ private[spark] class SparkSubmit extends Logging {
     }
 
     if (clusterManager == KUBERNETES) {
-      args.master = Utils.checkAndGetK8sMasterUrl(args.master)
+      args.maybeMaster = Option(Utils.checkAndGetK8sMasterUrl(args.master))
       // Make sure KUBERNETES is included in our build if we're trying to use it
       if (!Utils.classIsLoadable(KUBERNETES_CLUSTER_SUBMIT_CLASS) && !Utils.isTesting) {
         error(
@@ -283,6 +303,8 @@ private[spark] class SparkSubmit extends Logging {
         error("Cluster deploy mode is not applicable to Spark SQL shell.")
       case (_, CLUSTER) if isThriftServer(args.mainClass) =>
         error("Cluster deploy mode is not applicable to Spark Thrift server.")
+      case (_, CLUSTER) if isConnectServer(args.mainClass) =>
+        error("Cluster deploy mode is not applicable to Spark Connect server.")
       case _ =>
     }
 
@@ -299,6 +321,10 @@ private[spark] class SparkSubmit extends Logging {
     val isKubernetesClient = clusterManager == KUBERNETES && deployMode == CLIENT
     val isKubernetesClusterModeDriver = isKubernetesClient &&
       sparkConf.getBoolean("spark.kubernetes.submitInDriver", false)
+    val isCustomClasspathInClusterModeDisallowed =
+      !sparkConf.get(ALLOW_CUSTOM_CLASSPATH_BY_PROXY_USER_IN_CLUSTER_MODE) &&
+      args.proxyUser != null &&
+      (isYarnCluster || isMesosCluster || isStandAloneCluster || isKubernetesCluster)
 
     if (!isMesosCluster && !isStandAloneCluster) {
       // Resolve maven dependencies if there are any and add classpath to jars. Add them to py-files
@@ -308,21 +334,23 @@ private[spark] class SparkSubmit extends Logging {
         args.repositories, args.ivyRepoPath, args.ivySettingsPath)
 
       if (resolvedMavenCoordinates.nonEmpty) {
-        // In K8s client mode, when in the driver, add resolved jars early as we might need
-        // them at the submit time for artifact downloading.
-        // For example we might use the dependencies for downloading
-        // files from a Hadoop Compatible fs e.g. S3. In this case the user might pass:
-        // --packages com.amazonaws:aws-java-sdk:1.7.4:org.apache.hadoop:hadoop-aws:2.7.6
-        if (isKubernetesClusterModeDriver) {
-          val loader = getSubmitClassLoader(sparkConf)
-          for (jar <- resolvedMavenCoordinates) {
-            addJarToClasspath(jar, loader)
-          }
-        } else if (isKubernetesCluster) {
+        if (isKubernetesCluster) {
           // We need this in K8s cluster mode so that we can upload local deps
           // via the k8s application, like in cluster mode driver
           childClasspath ++= resolvedMavenCoordinates
         } else {
+          // In K8s client mode, when in the driver, add resolved jars early as we might need
+          // them at the submit time for artifact downloading.
+          // For example we might use the dependencies for downloading
+          // files from a Hadoop Compatible fs e.g. S3. In this case the user might pass:
+          // --packages com.amazonaws:aws-java-sdk:1.7.4:org.apache.hadoop:hadoop-aws:2.7.6
+          if (isKubernetesClusterModeDriver) {
+            val loader = getSubmitClassLoader(sparkConf)
+            for (jar <- resolvedMavenCoordinates) {
+              addJarToClasspath(jar, loader)
+            }
+          }
+
           args.jars = mergeFileLists(args.jars, mergeFileLists(resolvedMavenCoordinates: _*))
           if (args.isPython || isInternal(args.primaryResource)) {
             args.pyFiles = mergeFileLists(args.pyFiles,
@@ -383,43 +411,57 @@ private[spark] class SparkSubmit extends Logging {
       }.orNull
 
       if (isKubernetesClusterModeDriver) {
-        // Replace with the downloaded local jar path to avoid propagating hadoop compatible uris.
-        // Executors will get the jars from the Spark file server.
-        // Explicitly download the related files here
-        args.jars = localJars
-        val filesLocalFiles = Option(args.files).map {
-          downloadFileList(_, targetDir, sparkConf, hadoopConf)
-        }.orNull
-        val archiveLocalFiles = Option(args.archives).map { uris =>
+        // SPARK-33748: this mimics the behaviour of Yarn cluster mode. If the driver is running
+        // in cluster mode, the archives should be available in the driver's current working
+        // directory too.
+        // SPARK-33782 : This downloads all the files , jars , archiveFiles and pyfiles to current
+        // working directory
+        // SPARK-43540: add current working directory into driver classpath
+        val workingDirectory = "."
+        childClasspath += workingDirectory
+        def downloadResourcesToCurrentDirectory(uris: String, isArchive: Boolean = false):
+        String = {
           val resolvedUris = Utils.stringToSeq(uris).map(Utils.resolveURI)
-          val localArchives = downloadFileList(
+          val localResources = downloadFileList(
             resolvedUris.map(
               UriBuilder.fromUri(_).fragment(null).build().toString).mkString(","),
             targetDir, sparkConf, hadoopConf)
-
-          // SPARK-33748: this mimics the behaviour of Yarn cluster mode. If the driver is running
-          // in cluster mode, the archives should be available in the driver's current working
-          // directory too.
-          Utils.stringToSeq(localArchives).map(Utils.resolveURI).zip(resolvedUris).map {
-            case (localArchive, resolvedUri) =>
-              val source = new File(localArchive.getPath)
+          Utils.stringToSeq(localResources).map(Utils.resolveURI).zip(resolvedUris).map {
+            case (localResources, resolvedUri) =>
+              val source = new File(localResources.getPath).getCanonicalFile
               val dest = new File(
-                ".",
+                workingDirectory,
                 if (resolvedUri.getFragment != null) resolvedUri.getFragment else source.getName)
-              logInfo(
-                s"Unpacking an archive $resolvedUri " +
-                  s"from ${source.getAbsolutePath} to ${dest.getAbsolutePath}")
+                .getCanonicalFile
+              logInfo(s"Files $resolvedUri from $source to $dest")
               Utils.deleteRecursively(dest)
-              Utils.unpack(source, dest)
-
+              if (isArchive) {
+                Utils.unpack(source, dest)
+              } else {
+                Files.copy(source.toPath, dest.toPath)
+              }
               // Keep the URIs of local files with the given fragments.
               UriBuilder.fromUri(
-                localArchive).fragment(resolvedUri.getFragment).build().toString
+                localResources).fragment(resolvedUri.getFragment).build().toString
           }.mkString(",")
+        }
+
+        val filesLocalFiles = Option(args.files).map {
+          downloadResourcesToCurrentDirectory(_)
+        }.orNull
+        val jarsLocalJars = Option(args.jars).map {
+          downloadResourcesToCurrentDirectory(_)
+        }.orNull
+        val archiveLocalFiles = Option(args.archives).map {
+          downloadResourcesToCurrentDirectory(_, true)
+        }.orNull
+        val pyLocalFiles = Option(args.pyFiles).map {
+          downloadResourcesToCurrentDirectory(_)
         }.orNull
         args.files = filesLocalFiles
         args.archives = archiveLocalFiles
-        args.pyFiles = localPyFiles
+        args.pyFiles = pyLocalFiles
+        args.jars = jarsLocalJars
       }
     }
 
@@ -584,7 +626,16 @@ private[spark] class SparkSubmit extends Logging {
     val options = List[OptionAssigner](
 
       // All cluster managers
-      OptionAssigner(args.master, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES, confKey = "spark.master"),
+      OptionAssigner(
+        // If remote is not set, sets the master,
+        // In local remote mode, starts the default master to to start the server.
+        if (args.maybeRemote.isEmpty || sparkConf.contains("spark.local.connect")) args.master
+        else args.maybeMaster.orNull,
+        ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES, confKey = "spark.master"),
+      OptionAssigner(
+        // In local remote mode, do not set remote.
+        if (sparkConf.contains("spark.local.connect")) null
+        else args.maybeRemote.orNull, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES, confKey = "spark.remote"),
       OptionAssigner(args.deployMode, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES,
         confKey = SUBMIT_DEPLOY_MODE.key),
       OptionAssigner(args.name, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES, confKey = "spark.app.name"),
@@ -632,7 +683,7 @@ private[spark] class SparkSubmit extends Logging {
         confKey = EXECUTOR_CORES.key),
       OptionAssigner(args.executorMemory, STANDALONE | MESOS | YARN | KUBERNETES, ALL_DEPLOY_MODES,
         confKey = EXECUTOR_MEMORY.key),
-      OptionAssigner(args.totalExecutorCores, STANDALONE | MESOS | KUBERNETES, ALL_DEPLOY_MODES,
+      OptionAssigner(args.totalExecutorCores, STANDALONE | MESOS, ALL_DEPLOY_MODES,
         confKey = CORES_MAX.key),
       OptionAssigner(args.files, LOCAL | STANDALONE | MESOS | KUBERNETES, ALL_DEPLOY_MODES,
         confKey = FILES.key),
@@ -857,7 +908,19 @@ private[spark] class SparkSubmit extends Logging {
       childArgs ++= Seq("--verbose")
     }
 
-    sparkConf.set("spark.app.submitTime", System.currentTimeMillis().toString)
+    val setSubmitTimeInClusterModeDriver =
+      sparkConf.getBoolean("spark.kubernetes.setSubmitTimeInDriver", true)
+    if (!sparkConf.contains("spark.app.submitTime")
+      || isKubernetesClusterModeDriver && setSubmitTimeInClusterModeDriver) {
+      sparkConf.set("spark.app.submitTime", System.currentTimeMillis().toString)
+    }
+
+    if (childClasspath.nonEmpty && isCustomClasspathInClusterModeDisallowed) {
+      childClasspath.clear()
+      logWarning(s"Ignore classpath ${childClasspath.mkString(", ")} with proxy user specified " +
+        s"in Cluster mode when ${ALLOW_CUSTOM_CLASSPATH_BY_PROXY_USER_IN_CLUSTER_MODE.key} is " +
+        s"disabled")
+    }
 
     (childArgs.toSeq, childClasspath.toSeq, sparkConf, childMainClass)
   }
@@ -908,10 +971,14 @@ private[spark] class SparkSubmit extends Logging {
       logInfo(s"Main class:\n$childMainClass")
       logInfo(s"Arguments:\n${childArgs.mkString("\n")}")
       // sysProps may contain sensitive information, so redact before printing
-      logInfo(s"Spark config:\n${Utils.redact(sparkConf.getAll.toMap).mkString("\n")}")
+      logInfo(s"Spark config:\n${Utils.redact(sparkConf.getAll.toMap).sorted.mkString("\n")}")
       logInfo(s"Classpath elements:\n${childClasspath.mkString("\n")}")
       logInfo("\n")
     }
+    assert(!(args.deployMode == "cluster" && args.proxyUser != null && childClasspath.nonEmpty) ||
+      sparkConf.get(ALLOW_CUSTOM_CLASSPATH_BY_PROXY_USER_IN_CLUSTER_MODE),
+      s"Classpath of spark-submit should not change in cluster mode if proxy user is specified " +
+        s"when ${ALLOW_CUSTOM_CLASSPATH_BY_PROXY_USER_IN_CLUSTER_MODE.key} is disabled")
     val loader = getSubmitClassLoader(sparkConf)
     for (jar <- childClasspath) {
       addJarToClasspath(jar, loader)
@@ -927,6 +994,10 @@ private[spark] class SparkSubmit extends Logging {
         if (childMainClass.contains("thriftserver")) {
           logInfo(s"Failed to load main class $childMainClass.")
           logInfo("You need to build Spark with -Phive and -Phive-thriftserver.")
+        } else if (childMainClass.contains("org.apache.spark.sql.connect")) {
+          logInfo(s"Failed to load main class $childMainClass.")
+          // TODO(SPARK-42375): Should point out the user-facing page here instead.
+          logInfo("You need to specify Spark Connect jars with --jars or --packages.")
         }
         throw new SparkUserAppException(CLASS_NOT_FOUND_EXIT_STATUS)
       case e: NoClassDefFoundError =>
@@ -961,7 +1032,8 @@ private[spark] class SparkSubmit extends Logging {
         throw findCause(t)
     } finally {
       if (args.master.startsWith("k8s") && !isShell(args.primaryResource) &&
-          !isSqlShell(args.mainClass) && !isThriftServer(args.mainClass)) {
+          !isSqlShell(args.mainClass) && !isThriftServer(args.mainClass) &&
+          !isConnectServer(args.mainClass)) {
         try {
           SparkContext.getActive.foreach(_.stop())
         } catch {
@@ -1022,6 +1094,8 @@ object SparkSubmit extends CommandLineUtils with Logging {
     "org.apache.spark.deploy.k8s.submit.KubernetesClientApplication"
 
   override def main(args: Array[String]): Unit = {
+    Option(System.getenv("SPARK_PREFER_IPV6"))
+      .foreach(System.setProperty("java.net.preferIPv6Addresses", _))
     val submit = new SparkSubmit() {
       self =>
 
@@ -1081,6 +1155,13 @@ object SparkSubmit extends CommandLineUtils with Logging {
    */
   private def isThriftServer(mainClass: String): Boolean = {
     mainClass == "org.apache.spark.sql.hive.thriftserver.HiveThriftServer2"
+  }
+
+  /**
+   * Return whether the given main class represents a connect server.
+   */
+  private def isConnectServer(mainClass: String): Boolean = {
+    mainClass == "org.apache.spark.sql.connect.service.SparkConnectServer"
   }
 
   /**
@@ -1145,7 +1226,7 @@ private[spark] object SparkSubmitUtils extends Logging {
         s"be whitespace. The artifactId provided is: ${splits(1)}")
       require(splits(2) != null && splits(2).trim.nonEmpty, s"The version cannot be null or " +
         s"be whitespace. The version provided is: ${splits(2)}")
-      new MavenCoordinate(splits(0), splits(1), splits(2))
+      MavenCoordinate(splits(0), splits(1), splits(2))
     }
   }
 
@@ -1160,21 +1241,27 @@ private[spark] object SparkSubmitUtils extends Logging {
   }
 
   /**
-   * Extracts maven coordinates from a comma-delimited string
+   * Create a ChainResolver used by Ivy to search for and resolve dependencies.
+   *
    * @param defaultIvyUserDir The default user path for Ivy
+   * @param useLocalM2AsCache Whether to use the local maven repo as a cache
    * @return A ChainResolver used by Ivy to search for and resolve dependencies.
    */
-  def createRepoResolvers(defaultIvyUserDir: File): ChainResolver = {
+  def createRepoResolvers(
+      defaultIvyUserDir: File,
+      useLocalM2AsCache: Boolean = true): ChainResolver = {
     // We need a chain resolver if we want to check multiple repositories
     val cr = new ChainResolver
     cr.setName("spark-list")
 
-    val localM2 = new IBiblioResolver
-    localM2.setM2compatible(true)
-    localM2.setRoot(m2Path.toURI.toString)
-    localM2.setUsepoms(true)
-    localM2.setName("local-m2-cache")
-    cr.add(localM2)
+    if (useLocalM2AsCache) {
+      val localM2 = new IBiblioResolver
+      localM2.setM2compatible(true)
+      localM2.setRoot(m2Path.toURI.toString)
+      localM2.setUsepoms(true)
+      localM2.setName("local-m2-cache")
+      cr.add(localM2)
+    }
 
     val localIvy = new FileSystemResolver
     val localIvyRoot = new File(defaultIvyUserDir, "local")
@@ -1270,18 +1357,23 @@ private[spark] object SparkSubmitUtils extends Logging {
 
   /**
    * Build Ivy Settings using options with default resolvers
+   *
    * @param remoteRepos Comma-delimited string of remote repositories other than maven central
    * @param ivyPath The path to the local ivy repository
+   * @param useLocalM2AsCache Whether or not use `local-m2 repo` as cache
    * @return An IvySettings object
    */
-  def buildIvySettings(remoteRepos: Option[String], ivyPath: Option[String]): IvySettings = {
+  def buildIvySettings(
+      remoteRepos: Option[String],
+      ivyPath: Option[String],
+      useLocalM2AsCache: Boolean = true): IvySettings = {
     val ivySettings: IvySettings = new IvySettings
     processIvyPathArg(ivySettings, ivyPath)
 
     // create a pattern matcher
     ivySettings.addMatcher(new GlobPatternMatcher)
     // create the dependency resolvers
-    val repoResolver = createRepoResolvers(ivySettings.getDefaultIvyUserDir)
+    val repoResolver = createRepoResolvers(ivySettings.getDefaultIvyUserDir, useLocalM2AsCache)
     ivySettings.addResolver(repoResolver)
     ivySettings.setDefaultResolver(repoResolver.getName)
     processRemoteRepoArg(ivySettings, remoteRepos)
@@ -1378,7 +1470,7 @@ private[spark] object SparkSubmitUtils extends Logging {
    */
   private def clearIvyResolutionFiles(
       mdId: ModuleRevisionId,
-      ivySettings: IvySettings,
+      defaultCacheFile: File,
       ivyConfName: String): Unit = {
     val currentResolutionFiles = Seq(
       s"${mdId.getOrganisation}-${mdId.getName}-$ivyConfName.xml",
@@ -1386,14 +1478,40 @@ private[spark] object SparkSubmitUtils extends Logging {
       s"resolved-${mdId.getOrganisation}-${mdId.getName}-${mdId.getRevision}.properties"
     )
     currentResolutionFiles.foreach { filename =>
-      new File(ivySettings.getDefaultCache, filename).delete()
+      new File(defaultCacheFile, filename).delete()
+    }
+  }
+
+  /**
+   * Clear invalid cache files in ivy. The cache file is usually at
+   * ~/.ivy2/cache/${groupId}/${artifactId}/ivy-${version}.xml,
+   * ~/.ivy2/cache/${groupId}/${artifactId}/ivy-${version}.xml.original, and
+   * ~/.ivy2/cache/${groupId}/${artifactId}/ivydata-${version}.properties.
+   * Because when using `local-m2` repo as a cache, some invalid files were created.
+   * If not deleted here, an error prompt similar to `unknown resolver local-m2-cache`
+   * will be generated, making some confusion for users.
+   */
+  private def clearInvalidIvyCacheFiles(
+      mdId: ModuleRevisionId,
+      defaultCacheFile: File): Unit = {
+    val cacheFiles = Seq(
+      s"${mdId.getOrganisation}${File.separator}${mdId.getName}${File.separator}" +
+        s"ivy-${mdId.getRevision}.xml",
+      s"${mdId.getOrganisation}${File.separator}${mdId.getName}${File.separator}" +
+        s"ivy-${mdId.getRevision}.xml.original",
+      s"${mdId.getOrganisation}${File.separator}${mdId.getName}${File.separator}" +
+        s"ivydata-${mdId.getRevision}.properties")
+    cacheFiles.foreach { filename =>
+      new File(defaultCacheFile, filename).delete()
     }
   }
 
   /**
    * Resolves any dependencies that were supplied through maven coordinates
+   *
    * @param coordinates Comma-delimited string of maven coordinates
    * @param ivySettings An IvySettings containing resolvers to use
+   * @param noCacheIvySettings An no-cache(local-m2-cache) IvySettings containing resolvers to use
    * @param transitive Whether resolving transitive dependencies, default is true
    * @param exclusions Exclusions to apply when resolving transitive dependencies
    * @return Seq of path to the jars of the given maven artifacts including their
@@ -1402,6 +1520,7 @@ private[spark] object SparkSubmitUtils extends Logging {
   def resolveMavenCoordinates(
       coordinates: String,
       ivySettings: IvySettings,
+      noCacheIvySettings: Option[IvySettings] = None,
       transitive: Boolean,
       exclusions: Seq[String] = Nil,
       isTest: Boolean = false): Seq[String] = {
@@ -1430,6 +1549,8 @@ private[spark] object SparkSubmitUtils extends Logging {
         // scalastyle:on println
 
         val ivy = Ivy.newInstance(ivySettings)
+        ivy.pushContext()
+
         // Set resolve options to download transitive dependencies as well
         val resolveOptions = new ResolveOptions
         resolveOptions.setTransitive(transitive)
@@ -1442,6 +1563,11 @@ private[spark] object SparkSubmitUtils extends Logging {
         } else {
           resolveOptions.setDownload(true)
         }
+        // retrieve all resolved dependencies
+        retrieveOptions.setDestArtifactPattern(
+          packagesDirectory.getAbsolutePath + File.separator +
+            "[organization]_[artifact]-[revision](-[classifier]).[ext]")
+        retrieveOptions.setConfs(Array(ivyConfName))
 
         // Add exclusion rules for Spark and Scala Library
         addExclusionRules(ivySettings, ivyConfName, md)
@@ -1453,17 +1579,44 @@ private[spark] object SparkSubmitUtils extends Logging {
         // resolve dependencies
         val rr: ResolveReport = ivy.resolve(md, resolveOptions)
         if (rr.hasError) {
-          throw new RuntimeException(rr.getAllProblemMessages.toString)
+          // SPARK-46302: When there are some corrupted jars in the local maven repo,
+          // we try to continue without the cache
+          val failedReports = rr.getArtifactsReports(DownloadStatus.FAILED, true)
+          if (failedReports.nonEmpty && noCacheIvySettings.isDefined) {
+            val failedArtifacts = failedReports.map(r => r.getArtifact)
+            logInfo(s"Download failed: ${failedArtifacts.mkString("[", ", ", "]")}, " +
+              s"attempt to retry while skipping local-m2-cache.")
+            failedArtifacts.foreach(artifact => {
+              clearInvalidIvyCacheFiles(artifact.getModuleRevisionId, ivySettings.getDefaultCache)
+            })
+            ivy.popContext()
+
+            val noCacheIvy = Ivy.newInstance(noCacheIvySettings.get)
+            noCacheIvy.pushContext()
+
+            val noCacheRr = noCacheIvy.resolve(md, resolveOptions)
+            if (noCacheRr.hasError) {
+              throw new RuntimeException(noCacheRr.getAllProblemMessages.toString)
+            }
+            noCacheIvy.retrieve(noCacheRr.getModuleDescriptor.getModuleRevisionId, retrieveOptions)
+            val dependencyPaths = resolveDependencyPaths(
+              noCacheRr.getArtifacts.toArray, packagesDirectory)
+            noCacheIvy.popContext()
+
+            dependencyPaths
+          } else {
+            throw new RuntimeException(rr.getAllProblemMessages.toString)
+          }
+        } else {
+          ivy.retrieve(rr.getModuleDescriptor.getModuleRevisionId, retrieveOptions)
+          val dependencyPaths = resolveDependencyPaths(rr.getArtifacts.toArray, packagesDirectory)
+          ivy.popContext()
+
+          dependencyPaths
         }
-        // retrieve all resolved dependencies
-        ivy.retrieve(rr.getModuleDescriptor.getModuleRevisionId,
-          packagesDirectory.getAbsolutePath + File.separator +
-            "[organization]_[artifact]-[revision](-[classifier]).[ext]",
-          retrieveOptions.setConfs(Array(ivyConfName)))
-        resolveDependencyPaths(rr.getArtifacts.toArray, packagesDirectory)
       } finally {
         System.setOut(sysOut)
-        clearIvyResolutionFiles(md.getModuleRevisionId, ivySettings, ivyConfName)
+        clearIvyResolutionFiles(md.getModuleRevisionId, ivySettings.getDefaultCache, ivyConfName)
       }
     }
   }

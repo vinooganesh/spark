@@ -23,7 +23,8 @@ import org.apache.spark.sql.catalyst.expressions.Literal.FalseLiteral
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
-import org.apache.spark.sql.catalyst.trees.TreePattern.{LOCAL_RELATION, TRUE_OR_FALSE_LITERAL}
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
+import org.apache.spark.sql.catalyst.trees.TreePattern.{LOCAL_RELATION, REPARTITION_OPERATION, TRUE_OR_FALSE_LITERAL}
 
 /**
  * The base class of two rules in the normal and AQE Optimizer. It simplifies query plans with
@@ -39,11 +40,14 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.{LOCAL_RELATION, TRUE_OR_
  *       [[LocalRelation]].
  *  3. Unary-node Logical Plans
  *     - Project/Filter/Sample with all empty children.
- *     - Limit/Repartition with all empty children.
+ *     - Limit/Repartition/RepartitionByExpression/Rebalance with all empty children.
  *     - Aggregate with all empty children and at least one grouping expression.
  *     - Generate(Explode) with all empty children. Others like Hive UDTF may return results.
  */
 abstract class PropagateEmptyRelationBase extends Rule[LogicalPlan] with CastSupport {
+  // This tag is used to mark a repartition as a root repartition which is user-specified
+  private[sql] val ROOT_REPARTITION = TreeNodeTag[Unit]("ROOT_REPARTITION")
+
   protected def isEmpty(plan: LogicalPlan): Boolean = plan match {
     case p: LocalRelation => p.data.isEmpty
     case _ => false
@@ -136,8 +140,15 @@ abstract class PropagateEmptyRelationBase extends Rule[LogicalPlan] with CastSup
       case _: Sort => empty(p)
       case _: GlobalLimit if !p.isStreaming => empty(p)
       case _: LocalLimit if !p.isStreaming => empty(p)
-      case _: Repartition => empty(p)
-      case _: RepartitionByExpression => empty(p)
+      case _: Offset => empty(p)
+      case _: RepartitionOperation =>
+        if (p.getTagValue(ROOT_REPARTITION).isEmpty) {
+          empty(p)
+        } else {
+          p.unsetTagValue(ROOT_REPARTITION)
+          p
+        }
+      case _: RebalancePartitions => empty(p)
       // An aggregate with non-empty group expression will return one output row per group when the
       // input to the aggregate is not empty. If the input to the aggregate is empty then all groups
       // will be empty and thus the output will be empty. If we're working on batch data, we can
@@ -156,8 +167,43 @@ abstract class PropagateEmptyRelationBase extends Rule[LogicalPlan] with CastSup
       // Generators like Hive-style UDTF may return their records within `close`.
       case Generate(_: Explode, _, _, _, _, _) => empty(p)
       case Expand(_, _, _) => empty(p)
+      case _: Window => empty(p)
       case _ => p
     }
+  }
+
+  protected def userSpecifiedRepartition(p: LogicalPlan): Boolean = p match {
+    case _: Repartition => true
+    case r: RepartitionByExpression
+      if r.optNumPartitions.isDefined || r.partitionExpressions.nonEmpty => true
+    case _ => false
+  }
+
+  protected def applyInternal(plan: LogicalPlan): LogicalPlan
+
+  /**
+   * Add a [[ROOT_REPARTITION]] tag for the root user-specified repartition so this rule can
+   * skip optimize it.
+   */
+  private def addTagForRootRepartition(plan: LogicalPlan): LogicalPlan = {
+    if (!plan.containsPattern(REPARTITION_OPERATION)) {
+      return plan
+    }
+
+    plan match {
+      case p: Project => p.mapChildren(addTagForRootRepartition)
+      case f: Filter => f.mapChildren(addTagForRootRepartition)
+      case d: DeserializeToObject => d.mapChildren(addTagForRootRepartition)
+      case r if userSpecifiedRepartition(r) =>
+        r.setTagValue(ROOT_REPARTITION, ())
+        r
+      case _ => plan
+    }
+  }
+
+  override def apply(plan: LogicalPlan): LogicalPlan = {
+    val planWithTag = addTagForRootRepartition(plan)
+    applyInternal(planWithTag)
   }
 }
 
@@ -165,7 +211,7 @@ abstract class PropagateEmptyRelationBase extends Rule[LogicalPlan] with CastSup
  * This rule runs in the normal optimizer
  */
 object PropagateEmptyRelation extends PropagateEmptyRelationBase {
-  override def apply(plan: LogicalPlan): LogicalPlan = plan.transformUpWithPruning(
+  override protected def applyInternal(p: LogicalPlan): LogicalPlan = p.transformUpWithPruning(
     _.containsAnyPattern(LOCAL_RELATION, TRUE_OR_FALSE_LITERAL), ruleId) {
     commonApplyFunc
   }

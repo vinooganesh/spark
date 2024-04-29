@@ -25,11 +25,10 @@ import scala.reflect.ClassTag
 import scala.reflect.runtime.universe.TypeTag
 import scala.util.Random
 
-import org.apache.spark.{SparkConf, SparkFunSuite}
+import org.apache.spark.{SparkConf, SparkException, SparkFunSuite, SparkRuntimeException}
 import org.apache.spark.serializer.{JavaSerializer, KryoSerializer}
 import org.apache.spark.sql.{RandomDataGenerator, Row}
-import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
-import org.apache.spark.sql.catalyst.ScroogeLikeExample
+import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow, ScalaReflection, ScroogeLikeExample}
 import org.apache.spark.sql.catalyst.analysis.{ResolveTimeZone, SimpleAnalyzer, UnresolvedDeserializer}
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.encoders._
@@ -72,6 +71,38 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     val inputObject = BoundReference(0, ObjectType(cls), nullable = true)
     val invoke = Invoke(inputObject, "_2", IntegerType)
     checkEvaluationWithMutableProjection(invoke, null, inputRow)
+  }
+
+  test("SPARK-44525: Invoke could not find method") {
+    val inputRow = InternalRow(new Object)
+    val inputObject = BoundReference(0, ObjectType(classOf[Object]), nullable = false)
+
+    checkError(
+      exception = intercept[SparkException] {
+        Invoke(inputObject, "zeroArgNotExistMethod", IntegerType).eval(inputRow)
+      },
+      errorClass = "INTERNAL_ERROR",
+      parameters = Map("message" ->
+        ("Couldn't find method zeroArgNotExistMethod with arguments " +
+          "() on class java.lang.Object.")
+      )
+    )
+
+    checkError(
+      exception = intercept[SparkException] {
+        Invoke(
+          inputObject,
+          "oneArgNotExistMethod",
+          IntegerType,
+          Seq(Literal.fromObject(UTF8String.fromString("dummyInputString"))),
+          Seq(StringType)).eval(inputRow)
+      },
+      errorClass = "INTERNAL_ERROR",
+      parameters = Map("message" ->
+        ("Couldn't find method oneArgNotExistMethod with arguments " +
+          "(class org.apache.spark.unsafe.types.UTF8String) on class java.lang.Object.")
+      )
+    )
   }
 
   test("MapObjects should make copies of unsafe-backed data") {
@@ -423,7 +454,7 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       inputTypes = Nil,
       propagateNull = false,
       dataType = ObjectType(classOf[ScroogeLikeExample]),
-      outerPointer = Some(() => outerObj))
+      outerPointer = None)
     checkObjectExprEvaluation(newInst3, ScroogeLikeExample(1))
   }
 
@@ -452,7 +483,7 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     testTypes.foreach { dt =>
       genSchema(dt).map { schema =>
         val row = RandomDataGenerator.randomRow(random, schema)
-        val toRow = RowEncoder(schema).createSerializer()
+        val toRow = ExpressionEncoder(schema).createSerializer()
         val internalRow = toRow(row)
         val lambda = LambdaVariable("dummy", schema(0).dataType, schema(0).nullable, id = 0)
         checkEvaluationWithoutCodegen(lambda, internalRow.get(0, schema(0).dataType), internalRow)
@@ -467,7 +498,7 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     // with dummy input, resolve the plan by the analyzer, and replace the dummy input
     // with a literal for tests.
     val unresolvedDeser = UnresolvedDeserializer(encoderFor[Map[Int, String]].deserializer)
-    val dummyInputPlan = LocalRelation('value.map(MapType(IntegerType, StringType)))
+    val dummyInputPlan = LocalRelation(Symbol("value").map(MapType(IntegerType, StringType)))
     val plan = Project(Alias(unresolvedDeser, "none")() :: Nil, dummyInputPlan)
 
     val analyzedPlan = SimpleAnalyzer.execute(plan)
@@ -497,14 +528,19 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       (java.math.BigDecimal.valueOf(10), DecimalType.BigIntDecimal),
       (Array(3, 2, 1), ArrayType(IntegerType))
     ).foreach { case (input, dt) =>
+      val enc = RowEncoder.encoderForDataType(dt, lenient = false)
       val validateType = ValidateExternalType(
-        GetExternalRowField(inputObject, index = 0, fieldName = "c0"), dt)
+        GetExternalRowField(inputObject, index = 0, fieldName = "c0"),
+        dt,
+        EncoderUtils.lenientExternalDataTypeFor(enc))
       checkObjectExprEvaluation(validateType, input, InternalRow.fromSeq(Seq(Row(input))))
     }
 
     checkExceptionInExpression[RuntimeException](
       ValidateExternalType(
-        GetExternalRowField(inputObject, index = 0, fieldName = "c0"), DoubleType),
+        GetExternalRowField(inputObject, index = 0, fieldName = "c0"),
+        DoubleType,
+        DoubleType),
       InternalRow.fromSeq(Seq(Row(1))),
       "java.lang.Integer is not a valid external type for schema of double")
   }
@@ -537,13 +573,13 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   private def scalaMapSerializerFor[T: TypeTag, U: TypeTag](inputObject: Expression): Expression = {
-    import org.apache.spark.sql.catalyst.ScalaReflection._
+    val keyEnc = ScalaReflection.encoderFor[T]
+    val valueEnc = ScalaReflection.encoderFor[U]
 
-    def kvSerializerFor[V: TypeTag](inputObject: Expression): Expression =
-         localTypeOf[V].dealias match {
-       case t if t <:< localTypeOf[java.lang.Integer] =>
-         Invoke(inputObject, "intValue", IntegerType)
-       case t if t <:< localTypeOf[String] =>
+    def kvSerializerFor(enc: AgnosticEncoder[_])(inputObject: Expression): Expression = enc match {
+      case AgnosticEncoders.BoxedIntEncoder =>
+        Invoke(inputObject, "intValue", IntegerType)
+      case AgnosticEncoders.StringEncoder =>
         StaticInvoke(
           classOf[UTF8String],
           StringType,
@@ -556,12 +592,12 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
 
     ExternalMapToCatalyst(
       inputObject,
-      dataTypeFor[T],
-      kvSerializerFor[T],
-      keyNullable = !localTypeOf[T].typeSymbol.asClass.isPrimitive,
-      dataTypeFor[U],
-      kvSerializerFor[U],
-      valueNullable = !localTypeOf[U].typeSymbol.asClass.isPrimitive
+      EncoderUtils.externalDataTypeFor(keyEnc),
+      kvSerializerFor(keyEnc),
+      keyNullable = keyEnc.nullable,
+      EncoderUtils.externalDataTypeFor(valueEnc),
+      kvSerializerFor(valueEnc),
+      valueNullable = valueEnc.nullable
     )
   }
 
@@ -590,6 +626,7 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     // NULL key test
     val scalaMapHasNullKey = scala.collection.Map[java.lang.Integer, String](
       null.asInstanceOf[java.lang.Integer] -> "v0", java.lang.Integer.valueOf(1) -> "v1")
+
     val javaMapHasNullKey = new java.util.HashMap[java.lang.Integer, java.lang.String]() {
       {
         put(null, "v0")
@@ -601,15 +638,15 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     val serializer3 =
       javaMapSerializerFor(classOf[java.lang.Integer], classOf[java.lang.String])(
         Literal.fromObject(javaMapHasNullKey))
-    checkExceptionInExpression[RuntimeException](
-      serializer3, EmptyRow, "Cannot use null as map key!")
+    checkErrorInExpression[SparkRuntimeException](
+      serializer3, EmptyRow, "NULL_MAP_KEY", Map[String, String]())
 
     // Scala Map
     val serializer4 = scalaMapSerializerFor[java.lang.Integer, String](
       Literal.fromObject(scalaMapHasNullKey))
 
-    checkExceptionInExpression[RuntimeException](
-      serializer4, EmptyRow, "Cannot use null as map key!")
+    checkErrorInExpression[SparkRuntimeException](
+      serializer4, EmptyRow, "NULL_MAP_KEY", Map[String, String]())
   }
 
   test("SPARK-35244: invoke should throw the original exception") {

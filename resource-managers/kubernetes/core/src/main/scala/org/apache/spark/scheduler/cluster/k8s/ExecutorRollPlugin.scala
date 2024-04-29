@@ -25,6 +25,7 @@ import scala.collection.JavaConverters._
 import org.apache.spark.SparkContext
 import org.apache.spark.api.plugin.{DriverPlugin, ExecutorPlugin, PluginContext, SparkPlugin}
 import org.apache.spark.deploy.k8s.Config.{EXECUTOR_ROLL_INTERVAL, EXECUTOR_ROLL_POLICY, ExecutorRollPolicy, MINIMUM_TASKS_PER_EXECUTOR_BEFORE_ROLLING}
+import org.apache.spark.executor.ExecutorMetrics
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.DECOMMISSION_ENABLED
 import org.apache.spark.scheduler.ExecutorDecommissionInfo
@@ -47,6 +48,8 @@ class ExecutorRollPlugin extends SparkPlugin {
 }
 
 class ExecutorRollDriverPlugin extends DriverPlugin with Logging {
+  lazy val EMPTY_METRICS = new ExecutorMetrics(Array.emptyLongArray)
+
   private var sparkContext: SparkContext = _
 
   private val periodicService: ScheduledExecutorService =
@@ -61,7 +64,7 @@ class ExecutorRollDriverPlugin extends DriverPlugin with Logging {
     } else if (!sc.conf.get(DECOMMISSION_ENABLED)) {
       logWarning(s"Disabled because ${DECOMMISSION_ENABLED.key} is false.")
     } else {
-      minTasks = sparkContext.conf.get(MINIMUM_TASKS_PER_EXECUTOR_BEFORE_ROLLING)
+      minTasks = sc.conf.get(MINIMUM_TASKS_PER_EXECUTOR_BEFORE_ROLLING)
       // Scheduler is not created yet
       sparkContext = sc
 
@@ -99,6 +102,9 @@ class ExecutorRollDriverPlugin extends DriverPlugin with Logging {
 
   override def shutdown(): Unit = periodicService.shutdown()
 
+  private def getPeakMetrics(summary: v1.ExecutorSummary, name: String): Long =
+    summary.peakMemoryMetrics.getOrElse(EMPTY_METRICS).getMetricValue(name)
+
   private def choose(list: Seq[v1.ExecutorSummary], policy: ExecutorRollPolicy.Value)
       : Option[String] = {
     val listWithoutDriver = list
@@ -106,7 +112,8 @@ class ExecutorRollDriverPlugin extends DriverPlugin with Logging {
       .filter(_.totalTasks >= minTasks)
     val sortedList = policy match {
       case ExecutorRollPolicy.ID =>
-        listWithoutDriver.sortBy(_.id)
+        // We can convert to integer because EXECUTOR_ID_COUNTER uses AtomicInteger.
+        listWithoutDriver.sortBy(_.id.toInt)
       case ExecutorRollPolicy.ADD_TIME =>
         listWithoutDriver.sortBy(_.addTime)
       case ExecutorRollPolicy.TOTAL_GC_TIME =>
@@ -117,20 +124,40 @@ class ExecutorRollDriverPlugin extends DriverPlugin with Logging {
         listWithoutDriver.sortBy(e => e.totalDuration.toFloat / Math.max(1, e.totalTasks)).reverse
       case ExecutorRollPolicy.FAILED_TASKS =>
         listWithoutDriver.sortBy(_.failedTasks).reverse
+      case ExecutorRollPolicy.PEAK_JVM_ONHEAP_MEMORY =>
+        listWithoutDriver.sortBy(getPeakMetrics(_, "JVMHeapMemory")).reverse
+      case ExecutorRollPolicy.PEAK_JVM_OFFHEAP_MEMORY =>
+        listWithoutDriver.sortBy(getPeakMetrics(_, "JVMOffHeapMemory")).reverse
+      case ExecutorRollPolicy.TOTAL_SHUFFLE_WRITE =>
+        listWithoutDriver.sortBy(_.totalShuffleWrite).reverse
+      case ExecutorRollPolicy.DISK_USED =>
+        listWithoutDriver.sortBy(_.diskUsed).reverse
       case ExecutorRollPolicy.OUTLIER =>
-        // We build multiple outlier lists and concat in the following importance order to find
-        // outliers in various perspective:
-        //   AVERAGE_DURATION > TOTAL_DURATION > TOTAL_GC_TIME > FAILED_TASKS
-        // Since we will choose only first item, the duplication is okay. If there is no outlier,
-        // We fallback to TOTAL_DURATION policy.
-        outliers(listWithoutDriver.filter(_.totalTasks > 0), e => e.totalDuration / e.totalTasks) ++
-          outliers(listWithoutDriver, e => e.totalDuration) ++
-          outliers(listWithoutDriver, e => e.totalGCTime) ++
-          outliers(listWithoutDriver, e => e.failedTasks) ++
+        // If there is no outlier we fallback to TOTAL_DURATION policy.
+        outliersFromMultipleDimensions(listWithoutDriver) ++
           listWithoutDriver.sortBy(_.totalDuration).reverse
+      case ExecutorRollPolicy.OUTLIER_NO_FALLBACK =>
+        outliersFromMultipleDimensions(listWithoutDriver)
     }
     sortedList.headOption.map(_.id)
   }
+
+  /**
+   * We build multiple outlier lists and concat in the following importance order to find
+   * outliers in various perspective:
+   *   AVERAGE_DURATION > TOTAL_DURATION > TOTAL_GC_TIME > FAILED_TASKS >
+   *     PEAK_JVM_ONHEAP_MEMORY > PEAK_JVM_OFFHEAP_MEMORY > TOTAL_SHUFFLE_WRITE > DISK_USED
+   * Since we will choose only first item, the duplication is okay.
+   */
+  private def outliersFromMultipleDimensions(listWithoutDriver: Seq[v1.ExecutorSummary]) =
+    outliers(listWithoutDriver.filter(_.totalTasks > 0), e => e.totalDuration / e.totalTasks) ++
+      outliers(listWithoutDriver, e => e.totalDuration) ++
+      outliers(listWithoutDriver, e => e.totalGCTime) ++
+      outliers(listWithoutDriver, e => e.failedTasks) ++
+      outliers(listWithoutDriver, e => getPeakMetrics(e, "JVMHeapMemory")) ++
+      outliers(listWithoutDriver, e => getPeakMetrics(e, "JVMOffHeapMemory")) ++
+      outliers(listWithoutDriver, e => e.totalShuffleWrite) ++
+      outliers(listWithoutDriver, e => e.diskUsed)
 
   /**
    * Return executors whose metrics is outstanding, '(value - mean) > 2-sigma'. This is

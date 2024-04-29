@@ -30,6 +30,7 @@ from py4j.java_gateway import java_import, JavaGateway, JavaObject, GatewayParam
 from py4j.clientserver import ClientServer, JavaParameters, PythonParameters
 from pyspark.find_spark_home import _find_spark_home
 from pyspark.serializers import read_int, write_with_length, UTF8Deserializer
+from pyspark.errors import PySparkRuntimeError
 
 
 def launch_gateway(conf=None, popen_kwargs=None):
@@ -103,7 +104,10 @@ def launch_gateway(conf=None, popen_kwargs=None):
                 time.sleep(0.1)
 
             if not os.path.isfile(conn_info_file):
-                raise RuntimeError("Java gateway process exited before sending its port number")
+                raise PySparkRuntimeError(
+                    error_class="JAVA_GATEWAY_EXITED",
+                    message_parameters={},
+                )
 
             with open(conn_info_file, "rb") as info:
                 gateway_port = read_int(info)
@@ -172,7 +176,10 @@ def _do_server_auth(conn, auth_secret):
     reply = UTF8Deserializer().loads(conn)
     if reply != "ok":
         conn.close()
-        raise RuntimeError("Unexpected reply from iterator server.")
+        raise PySparkRuntimeError(
+            error_class="UNEXPECTED_RESPONSE_FROM_SERVER",
+            message_parameters={},
+        )
 
 
 def local_connect_and_auth(port, auth_secret):
@@ -193,8 +200,10 @@ def local_connect_and_auth(port, auth_secret):
     sock = None
     errors = []
     # Support for both IPv4 and IPv6.
-    # On most of IPv6-ready systems, IPv6 will take precedence.
-    for res in socket.getaddrinfo("127.0.0.1", port, socket.AF_UNSPEC, socket.SOCK_STREAM):
+    addr = "127.0.0.1"
+    if os.environ.get("SPARK_PREFER_IPV6", "false").lower() == "true":
+        addr = "::1"
+    for res in socket.getaddrinfo(addr, port, socket.AF_UNSPEC, socket.SOCK_STREAM):
         af, socktype, proto, _, sa = res
         try:
             sock = socket.socket(af, socktype, proto)
@@ -208,7 +217,12 @@ def local_connect_and_auth(port, auth_secret):
             errors.append("tried to connect to %s, but an error occurred: %s" % (sa, emsg))
             sock.close()
             sock = None
-    raise RuntimeError("could not open socket: %s" % errors)
+    raise PySparkRuntimeError(
+        error_class="CANNOT_OPEN_SOCKET",
+        message_parameters={
+            "errors": str(errors),
+        },
+    )
 
 
 def ensure_callback_server_started(gw):

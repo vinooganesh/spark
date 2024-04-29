@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.analysis
 import java.net.URI
 import java.util.Locale
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.{QueryPlanningTracker, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog.{CatalogDatabase, CatalogStorageFormat, CatalogTable, CatalogTableType, InMemoryCatalog, SessionCatalog, TemporaryViewRelation}
@@ -33,6 +34,8 @@ import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 import org.apache.spark.sql.types.StructType
 
 trait AnalysisTest extends PlanTest {
+
+  import org.apache.spark.QueryContext
 
   protected def extendedAnalysisRules: Seq[Rule[LogicalPlan]] = Nil
 
@@ -81,6 +84,8 @@ trait AnalysisTest extends PlanTest {
     createTempView(catalog, "TaBlE3", TestRelations.testRelation3, overrideIfExists = true)
     createGlobalTempView(catalog, "TaBlE4", TestRelations.testRelation4, overrideIfExists = true)
     createGlobalTempView(catalog, "TaBlE5", TestRelations.testRelation5, overrideIfExists = true)
+    createTempView(catalog, "streamingTable", TestRelations.streamingRelation,
+      overrideIfExists = true)
     new Analyzer(catalog) {
       override val extendedResolutionRules = extendedAnalysisRules
     }
@@ -108,7 +113,8 @@ trait AnalysisTest extends PlanTest {
         case v: View if v.isTempViewStoringAnalyzedPlan => v.child
       }
       val actualPlan = if (inlineCTE) {
-        InlineCTE(transformed)
+        val inlineCTE = InlineCTE()
+        inlineCTE(transformed)
       } else {
         transformed
       }
@@ -172,39 +178,40 @@ trait AnalysisTest extends PlanTest {
   protected def assertAnalysisErrorClass(
       inputPlan: LogicalPlan,
       expectedErrorClass: String,
-      expectedMessageParameters: Array[String],
+      expectedMessageParameters: Map[String, String],
+      queryContext: Array[QueryContext] = Array.empty,
       caseSensitive: Boolean = true): Unit = {
     withSQLConf(SQLConf.CASE_SENSITIVE.key -> caseSensitive.toString) {
       val analyzer = getAnalyzer
       val e = intercept[AnalysisException] {
         analyzer.checkAnalysis(analyzer.execute(inputPlan))
       }
-
-      if (e.getErrorClass != expectedErrorClass ||
-        !e.messageParameters.sameElements(expectedMessageParameters)) {
-        var failMsg = ""
-        if (e.getErrorClass != expectedErrorClass) {
-          failMsg +=
-            s"""Error class should be: ${expectedErrorClass}
-               |Actual error class: ${e.getErrorClass}
-             """.stripMargin
-        }
-        if (!e.messageParameters.sameElements(expectedMessageParameters)) {
-          failMsg +=
-            s"""Message parameters should be: ${expectedMessageParameters.mkString("\n  ")}
-               |Actual message parameters: ${e.messageParameters.mkString("\n  ")}
-             """.stripMargin
-        }
-        fail(failMsg)
-      }
+      checkError(
+        exception = e,
+        errorClass = expectedErrorClass,
+        parameters = expectedMessageParameters,
+        queryContext = queryContext
+      )
     }
   }
 
-  protected def interceptParseException(
-      parser: String => Any)(sqlCommand: String, messages: String*): Unit = {
-    val e = intercept[ParseException](parser(sqlCommand))
+  protected def interceptParseException(parser: String => Any)(
+    sqlCommand: String, messages: String*)(
+    errorClass: Option[String] = None): Unit = {
+    val e = parseException(parser)(sqlCommand)
     messages.foreach { message =>
       assert(e.message.contains(message))
     }
+    if (errorClass.isDefined) {
+      assert(e.getErrorClass == errorClass.get)
+    }
+  }
+
+  protected def parseException(parser: String => Any)(sqlText: String): ParseException = {
+    intercept[ParseException](parser(sqlText))
+  }
+
+  protected def internalException(parser: String => Any)(sqlText: String): SparkException = {
+    intercept[SparkException](parser(sqlText))
   }
 }

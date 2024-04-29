@@ -17,16 +17,16 @@
 
 package org.apache.spark.sql.expressions
 
-import scala.collection.parallel.immutable.ParVector
-
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, InternalRow}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.execution.HiveResult.hiveResultString
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.util.Utils
+import org.apache.spark.tags.SlowSQLTest
+import org.apache.spark.util.{ThreadUtils, Utils}
 
+@SlowSQLTest
 class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
 
   test("Replace _FUNC_ in ExpressionInfo") {
@@ -170,6 +170,7 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
       // One of examples shows getting the current timestamp
       "org.apache.spark.sql.catalyst.expressions.UnixTimestamp",
       "org.apache.spark.sql.catalyst.expressions.CurrentDate",
+      "org.apache.spark.sql.catalyst.expressions.CurDateExpressionBuilder",
       "org.apache.spark.sql.catalyst.expressions.CurrentTimestamp",
       "org.apache.spark.sql.catalyst.expressions.CurrentTimeZone",
       "org.apache.spark.sql.catalyst.expressions.Now",
@@ -194,12 +195,15 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
       // The encrypt expression includes a random initialization vector to its encrypted result
       classOf[AesEncrypt].getName)
 
-    val parFuncs = new ParVector(spark.sessionState.functionRegistry.listFunction().toVector)
-    parFuncs.foreach { funcId =>
+    ThreadUtils.parmap(
+      spark.sessionState.functionRegistry.listFunction(),
+      prefix = "ExpressionInfoSuite-check-outputs-of-expression-examples",
+      maxThreads = Runtime.getRuntime.availableProcessors
+    ) { funcId =>
       // Examples can change settings. We clone the session to prevent tests clashing.
       val clonedSpark = spark.cloneSession()
       // Coalescing partitions can change result order, so disable it.
-      clonedSpark.sessionState.conf.setConf(SQLConf.COALESCE_PARTITIONS_ENABLED, false)
+      clonedSpark.conf.set(SQLConf.COALESCE_PARTITIONS_ENABLED, false)
       val info = clonedSpark.sessionState.catalog.lookupFunctionInfo(funcId)
       val className = info.getClassName
       if (!ignoreSet.contains(className)) {
@@ -228,11 +232,6 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
 
     // Do not check these expressions, because these expressions override the eval method
     val ignoreSet = Set(
-      // Extend NullIntolerant and avoid evaluating input1 if input2 is 0
-      classOf[IntegralDivide],
-      classOf[Divide],
-      classOf[Remainder],
-      classOf[Pmod],
       // Throws an exception, even if input is null
       classOf[RaiseError]
     )
@@ -242,6 +241,8 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
       .filterNot(c => ignoreSet.exists(_.getName.equals(c)))
       .map(name => Utils.classForName(name))
       .filterNot(classOf[NonSQLExpression].isAssignableFrom)
+      // BinaryArithmetic overrides the eval method
+      .filterNot(classOf[BinaryArithmetic].isAssignableFrom)
 
     exprTypesToCheck.foreach { superClass =>
       candidateExprsToCheck.filter(superClass.isAssignableFrom).foreach { clazz =>
@@ -261,7 +262,7 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
     }
   }
 
-  test("Check source for different kind of UDFs") {
+  test("Check source for Built-in and Scala UDF") {
     import org.apache.spark.sql.IntegratedUDFTestUtils
     val catalog = spark.sessionState.catalog
     assert(catalog.lookupFunctionInfo(FunctionIdentifier("sum")).getSource === "built-in")
@@ -270,7 +271,13 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
     IntegratedUDFTestUtils.registerTestUDF(scalaUDF, spark)
     val scalaInfo = catalog.lookupFunctionInfo(FunctionIdentifier(scalaUDF.name))
     assert(scalaInfo.getSource === "scala_udf")
+  }
 
+  test("Check source for Python UDF") {
+    import org.apache.spark.sql.IntegratedUDFTestUtils
+    assume(IntegratedUDFTestUtils.shouldTestPythonUDFs)
+
+    val catalog = spark.sessionState.catalog
     val pythonUDF = IntegratedUDFTestUtils.TestPythonUDF("pythonUDF")
     IntegratedUDFTestUtils.registerTestUDF(pythonUDF, spark)
     val pythonInfo = catalog.lookupFunctionInfo(FunctionIdentifier(pythonUDF.name))
